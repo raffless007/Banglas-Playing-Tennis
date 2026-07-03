@@ -15,8 +15,9 @@ Players do not need an account. They choose their name from the roster.
 This creates the tables and the initial 18-player roster. Row Level Security is
 enabled and the browser has no direct table access.
 
-If you created the database using an earlier version, run only
-`supabase/migrations/001_add_scores.sql` to add the Scores table.
+If you created the database using an earlier version, run the migration files
+you have not previously applied. `002_court_fee.sql` changes only
+the default court fee, leaving every existing event fee untouched.
 
 ## 2. Upload this project to GitHub
 
@@ -27,9 +28,9 @@ If you created the database using an earlier version, run only
 ```
 public/index.html
 netlify/functions/api.mjs
-netlify/functions/reminders.mjs
 supabase/schema.sql
 supabase/migrations/001_add_scores.sql
+supabase/migrations/002_court_fee.sql
 netlify.toml
 package.json
 .gitignore
@@ -61,27 +62,17 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 Never put the service-role key in `public/index.html`, GitHub, or any browser
 code. After adding variables, trigger a new Netlify production deployment.
 
-## 5. Optional reminder emails
-
-The hourly reminder function is included. To make it send email, create a
-Resend account, verify a sending domain, and add:
-
-| Variable | Value |
-| --- | --- |
-| `RESEND_API_KEY` | Private Resend API key |
-| `REMINDER_FROM_EMAIL` | Sender on the verified domain |
-| `ADMIN_EMAIL` | Address receiving the 72-hour payment report |
-
-Add each player's email from **Admin → Player roster** after deployment.
-
 ## Rules implemented
 
 - Public player access with no account or password.
 - Four upcoming Wednesday events are generated automatically.
+- Newly generated events default to a $54 court fee; existing fees are retained.
 - EOI options are only **I'm in** and **Can't make it**.
 - Every week starts with no responses.
 - EOIs lock six hours before the configured start time.
-- Payments appear only after the game and only for players marked **In**.
+- The Payments tab and weekly history are always visible.
+- Payment confirmation stays locked until that week's configured session end.
+- After the session, only players marked **In** can confirm payment.
 - Each player pays `court fee ÷ In players + ball fee`.
 - Weekly scores are visible to everyone, but only players marked **In** can add them.
 - Every match is doubles: exactly two players on Team 1 and two on Team 2.
@@ -91,7 +82,6 @@ Add each player's email from **Admin → Player roster** after deployment.
 - Sets are first to 4 games; at 3–3, the tie-break is first to 5 points and must be won by 2.
 - The admin passcode is hashed and stored in Supabase.
 - Admin sessions expire after eight hours.
-- Player reminders run after 48 hours and the admin report after 72 hours.
 
 ## Important identity limitation
 
