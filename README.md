@@ -1,7 +1,7 @@
 # Banglas Playing Tennis — shared online version
 
 This repository deploys the public website to Netlify and stores shared EOIs,
-events, payments, roster details and the admin passcode in Supabase.
+events, payments, scores, media, roster details and the admin passcode in Supabase.
 
 Players do not need an account. They choose their name from the roster.
 
@@ -19,6 +19,9 @@ If you created the database using an earlier version, run the migration files
 you have not previously applied. `002_court_fee.sql` changes only
 the default court fee. `003_update_upcoming_court_fees.sql` changes upcoming
 events still using the old $52 value to $54, while preserving other admin-set fees.
+`004_second_court_and_media.sql` adds optional second-court fields, the media
+archive table, and a public `tennis-media` Storage bucket. This migration must
+be run before deploying the matching app/API update.
 
 ## 2. Upload this project to GitHub
 
@@ -28,11 +31,13 @@ events still using the old $52 value to $54, while preserving other admin-set fe
 
 ```
 public/index.html
+public/assets/tennis-app-icon.png
 netlify/functions/api.mjs
 supabase/schema.sql
 supabase/migrations/001_add_scores.sql
 supabase/migrations/002_court_fee.sql
 supabase/migrations/003_update_upcoming_court_fees.sql
+supabase/migrations/004_second_court_and_media.sql
 netlify.toml
 package.json
 .gitignore
@@ -73,11 +78,17 @@ code. After adding variables, trigger a new Netlify production deployment.
 - Every week starts with no responses.
 - EOIs lock six hours before the configured start time.
 - After the deadline, the Play page shows the final player list, match time and location.
+- Admin can add a second court with its own name, start time, end time and cost.
+- When two courts are active, payment uses `(court 1 + court 2) ÷ In players + ball fee`.
+- The final Play summary shows both courts and the combined court fee.
 - The live EOI list labels every player as **In**, **Out** or **No reply**.
 - The Payments tab and weekly history are always visible.
 - Payment confirmation stays locked until that week's configured session end.
 - After the session, only players marked **In** can confirm payment.
-- Each player pays `court fee ÷ In players + ball fee`.
+- Each player pays `total active court fees ÷ In players + ball fee`.
+- The Media tab accepts images and videos up to 200 MB from any selected player.
+- Media is sorted by date, displayed as gallery tiles and available for download.
+- Admin can permanently remove an incorrect media upload.
 - Weekly scores are visible to everyone, but only players marked **In** can add them.
 - Every match is doubles: exactly two players on Team 1 and two on Team 2.
 - Players can add and save any number of new teams and matchups for a week.
@@ -86,6 +97,8 @@ code. After adding variables, trigger a new Netlify production deployment.
 - Sets are first to 4 games; at 3–3, the tie-break is first to 5 points and must be won by 2.
 - The admin passcode is hashed and stored in Supabase.
 - Admin sessions expire after eight hours.
+- Admin can override any player's EOI before or after the six-hour deadline.
+- Admin can rename roster players, correct paid/unpaid status and delete incorrect scores.
 
 ## Important identity limitation
 
