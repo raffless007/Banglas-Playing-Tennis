@@ -2,14 +2,18 @@ import {
   createHmac,
   pbkdf2Sync,
   randomBytes,
+  randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET;
 const INITIAL_PASSCODE = process.env.INITIAL_ADMIN_PASSCODE || "1234";
 const SYDNEY = "Australia/Sydney";
+const MEDIA_BUCKET = "tennis-media";
+const MEDIA_MAX_BYTES = 200 * 1024 * 1024;
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -19,6 +23,27 @@ function requireConfiguration() {
   if (!SUPABASE_URL || !SERVICE_KEY || !SESSION_SECRET) {
     throw new Error("Server environment variables are not configured.");
   }
+}
+
+function storageClient() {
+  return createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+function eventStartTime(event) {
+  return event.court_2_enabled && event.court_2_start_time < event.start_time ? event.court_2_start_time : event.start_time;
+}
+
+function eventEndTime(event) {
+  return event.court_2_enabled && event.court_2_end_time > event.end_time ? event.court_2_end_time : event.end_time;
+}
+
+function totalCourtFee(event) {
+  return Number(event.court_fee) + (event.court_2_enabled ? Number(event.court_2_fee || 0) : 0);
+}
+
+function publicMediaUrl(path) {
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  return `${SUPABASE_URL}/storage/v1/object/public/${MEDIA_BUCKET}/${encoded}`;
 }
 
 async function db(path, options = {}) {
@@ -143,14 +168,16 @@ async function savePasscode(passcode) {
 
 async function appState() {
   await ensureUpcomingEvents();
-  const [players, events, eois, payments, scores] = await Promise.all([
+  const [players, events, eois, payments, scores, mediaRows] = await Promise.all([
     db("players?select=id,name,active&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
     db("match_scores?select=*&order=created_at.asc"),
+    db("media_items?select=*&order=captured_at.desc,created_at.desc"),
   ]);
-  return { players, events, eois, payments, scores, serverNow: new Date().toISOString() };
+  const media = mediaRows.map(item => ({ ...item, public_url: publicMediaUrl(item.storage_path) }));
+  return { players, events, eois, payments, scores, media, serverNow: new Date().toISOString() };
 }
 
 async function adminState() {
@@ -161,7 +188,7 @@ async function submitEoi(body) {
   if (!body.playerId || !body.eventId || !["yes", "no"].includes(body.status)) return reply({ error: "Invalid EOI." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
-  const closesAt = new Date(localDateTimeToUtc(event.event_date, event.start_time, event.timezone).getTime() - 6 * 60 * 60 * 1000);
+  const closesAt = new Date(localDateTimeToUtc(event.event_date, eventStartTime(event), event.timezone).getTime() - 6 * 60 * 60 * 1000);
   if (new Date() >= closesAt) return reply({ error: "The EOI deadline has passed." }, 409);
   await db("eois?on_conflict=event_id,player_id", {
     method: "POST",
@@ -174,10 +201,10 @@ async function submitEoi(body) {
 async function markPaid(body) {
   const event = await getEvent(body.eventId);
   if (!event || !body.playerId) return reply({ error: "Event or player not found." }, 404);
-  if (new Date() < localDateTimeToUtc(event.event_date, event.end_time, event.timezone)) return reply({ error: "Payments open after the game finishes." }, 409);
+  if (new Date() < localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) return reply({ error: "Payments open after the game finishes." }, 409);
   const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&select=player_id`);
   if (!attending.some(row => row.player_id === body.playerId)) return reply({ error: "Only players marked In can confirm payment." }, 403);
-  const amount = Number((Number(event.court_fee) / attending.length + Number(event.ball_fee)).toFixed(2));
+  const amount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
   await db("payments?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -262,7 +289,7 @@ async function changePasscode(body) {
 }
 
 async function saveEvent(body) {
-  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_fee", "ball_fee", "account_closed"];
+  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed"];
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
   update.updated_at = new Date().toISOString();
   await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
@@ -288,6 +315,148 @@ async function removePlayer(body) {
   return reply({ ok: true });
 }
 
+async function adminSetEoi(body) {
+  if (!body.eventId || !body.playerId || !["yes", "no", "none"].includes(body.status)) {
+    return reply({ error: "Choose a valid player and EOI status." }, 400);
+  }
+  if (body.status === "none") {
+    await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+    await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+    return reply({ ok: true });
+  }
+  await db("eois?on_conflict=event_id,player_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({
+      event_id: body.eventId,
+      player_id: body.playerId,
+      status: body.status,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  if (body.status === "no") {
+    await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+  }
+  return reply({ ok: true });
+}
+
+async function adminSetPayment(body) {
+  if (!body.eventId || !body.playerId || typeof body.paid !== "boolean") {
+    return reply({ error: "Choose a valid payment status." }, 400);
+  }
+  if (!body.paid) {
+    await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+    return reply({ ok: true });
+  }
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Event not found." }, 404);
+  const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&select=player_id`);
+  if (!attending.some(row => row.player_id === body.playerId)) {
+    return reply({ error: "Only players marked In can have a payment recorded." }, 409);
+  }
+  const amount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
+  await db("payments?on_conflict=event_id,player_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({
+      event_id: body.eventId,
+      player_id: body.playerId,
+      amount,
+      paid: true,
+      paid_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  return reply({ ok: true });
+}
+
+async function adminDeleteScore(body) {
+  if (!body.scoreId) return reply({ error: "Score not found." }, 404);
+  await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}`, {
+    method: "DELETE", headers: { Prefer: "return=minimal" },
+  });
+  return reply({ ok: true });
+}
+
+async function createMediaUpload(body) {
+  const originalName = String(body.fileName || "").trim();
+  const mimeType = String(body.mimeType || "").toLowerCase();
+  const fileSize = Number(body.fileSize);
+  if (!body.playerId || !originalName || !/^(image|video)\//.test(mimeType)) {
+    return reply({ error: "Choose an image or video to upload." }, 400);
+  }
+  if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
+    return reply({ error: "Media files must be 200 MB or smaller." }, 400);
+  }
+  const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
+  if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
+  const extensionMatch = originalName.toLowerCase().match(/\.([a-z0-9]{1,10})$/);
+  const extension = extensionMatch ? `.${extensionMatch[1]}` : "";
+  const now = datePartsInSydney();
+  const folder = `${now.year}/${String(now.month).padStart(2, "0")}`;
+  const path = `${folder}/${randomUUID()}${extension}`;
+  const { data, error } = await storageClient().storage.from(MEDIA_BUCKET).createSignedUploadUrl(path);
+  if (error || !data?.signedUrl) throw error || new Error("Could not create the upload URL.");
+  return reply({ ok: true, path, signedUrl: data.signedUrl });
+}
+
+async function finalizeMediaUpload(body) {
+  const title = String(body.title || "").trim();
+  const path = String(body.path || "");
+  const originalName = String(body.originalName || "").trim();
+  const mimeType = String(body.mimeType || "").toLowerCase();
+  const capturedAt = String(body.capturedAt || "");
+  if (!body.playerId || title.length < 1 || title.length > 120 || !/^\d{4}\/\d{2}\/[a-f0-9-]+(?:\.[a-z0-9]{1,10})?$/.test(path)) {
+    return reply({ error: "Complete the media title and upload details." }, 400);
+  }
+  if (!/^(image|video)\//.test(mimeType) || !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
+    return reply({ error: "Invalid media type or date." }, 400);
+  }
+  const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
+  if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
+  const segments = path.split("/");
+  const fileName = segments.pop();
+  const folder = segments.join("/");
+  const { data: stored, error } = await storageClient().storage.from(MEDIA_BUCKET).list(folder, { search: fileName, limit: 10 });
+  if (error || !stored?.some(item => item.name === fileName)) {
+    return reply({ error: "The uploaded file could not be verified." }, 409);
+  }
+  await db("media_items", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      player_id: body.playerId,
+      title,
+      media_type: mimeType.startsWith("image/") ? "image" : "video",
+      storage_path: path,
+      original_name: originalName.slice(0, 255),
+      mime_type: mimeType,
+      captured_at: capturedAt,
+    }),
+  });
+  return reply({ ok: true });
+}
+
+async function adminDeleteMedia(body) {
+  const rows = await db(`media_items?id=eq.${encodeURIComponent(body.mediaId || "")}&select=id,storage_path`);
+  const item = rows?.[0];
+  if (!item) return reply({ error: "Media item not found." }, 404);
+  const { error } = await storageClient().storage.from(MEDIA_BUCKET).remove([item.storage_path]);
+  if (error) throw error;
+  await db(`media_items?id=eq.${encodeURIComponent(item.id)}`, {
+    method: "DELETE", headers: { Prefer: "return=minimal" },
+  });
+  return reply({ ok: true });
+}
+
 async function updatePlayer(body) {
   const update = {};
   if (typeof body.name === "string" && body.name.trim()) update.name = body.name.trim();
@@ -309,13 +478,15 @@ export default async (req) => {
     if (req.method === "POST" && action === "eoi") return submitEoi(body);
     if (req.method === "POST" && action === "paid") return markPaid(body);
     if (req.method === "POST" && action === "score") return submitScore(body);
+    if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
+    if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
     if (req.method === "GET" && action === "admin-state") {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-add-player", "admin-update-player", "admin-remove-player"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-delete-score", "admin-delete-media"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -324,6 +495,10 @@ export default async (req) => {
     if (action === "admin-add-player") return addPlayer(body);
     if (action === "admin-update-player") return updatePlayer(body);
     if (action === "admin-remove-player") return removePlayer(body);
+    if (action === "admin-set-eoi") return adminSetEoi(body);
+    if (action === "admin-set-payment") return adminSetPayment(body);
+    if (action === "admin-delete-score") return adminDeleteScore(body);
+    if (action === "admin-delete-media") return adminDeleteMedia(body);
   } catch (error) {
     console.error(error);
     return reply({ error: "The server could not complete that request." }, 500);
