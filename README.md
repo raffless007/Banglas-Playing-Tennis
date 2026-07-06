@@ -17,7 +17,8 @@ enabled and the browser has no direct table access.
 
 If you created the database using an earlier version, run the migration files
 you have not previously applied. `002_court_fee.sql` changes only
-the default court fee, leaving every existing event fee untouched.
+the default court fee. `003_update_upcoming_court_fees.sql` changes upcoming
+events still using the old $52 value to $54, while preserving other admin-set fees.
 
 ## 2. Upload this project to GitHub
 
@@ -31,6 +32,7 @@ netlify/functions/api.mjs
 supabase/schema.sql
 supabase/migrations/001_add_scores.sql
 supabase/migrations/002_court_fee.sql
+supabase/migrations/003_update_upcoming_court_fees.sql
 netlify.toml
 package.json
 .gitignore
@@ -70,6 +72,8 @@ code. After adding variables, trigger a new Netlify production deployment.
 - EOI options are only **I'm in** and **Can't make it**.
 - Every week starts with no responses.
 - EOIs lock six hours before the configured start time.
+- After the deadline, the Play page shows the final player list, match time and location.
+- The live EOI list labels every player as **In**, **Out** or **No reply**.
 - The Payments tab and weekly history are always visible.
 - Payment confirmation stays locked until that week's configured session end.
 - After the session, only players marked **In** can confirm payment.
