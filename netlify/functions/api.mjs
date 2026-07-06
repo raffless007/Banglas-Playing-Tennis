@@ -69,6 +69,13 @@ async function ensureUpcomingEvents() {
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify(events),
   });
+  const now = datePartsInSydney();
+  const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
+  await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ court_fee: 54, updated_at: new Date().toISOString() }),
+  });
 }
 
 function timezoneOffsetMs(date, timeZone) {
@@ -147,7 +154,7 @@ async function appState() {
 }
 
 async function adminState() {
-  return { players: await db("players?select=id,name,email,active&order=name.asc") };
+  return { players: await db("players?select=id,name,active&order=name.asc") };
 }
 
 async function submitEoi(body) {
@@ -269,7 +276,7 @@ async function addPlayer(body) {
   if (name.length < 2 || name.length > 80) return reply({ error: "Enter a valid player name." }, 400);
   await db("players?on_conflict=name", {
     method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify({ name, email: body.email || null, active: true }),
+    body: JSON.stringify({ name, active: true }),
   });
   return reply({ ok: true });
 }
@@ -284,38 +291,11 @@ async function removePlayer(body) {
 async function updatePlayer(body) {
   const update = {};
   if (typeof body.name === "string" && body.name.trim()) update.name = body.name.trim();
-  if (typeof body.email === "string") update.email = body.email.trim() || null;
   if (!body.playerId || !Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
   await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
   });
   return reply({ ok: true });
-}
-
-async function sendEmail({ to, subject, html }) {
-  if (!process.env.RESEND_API_KEY || !process.env.REMINDER_FROM_EMAIL || !to) return false;
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { authorization: `Bearer ${process.env.RESEND_API_KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ from: process.env.REMINDER_FROM_EMAIL, to, subject, html }),
-  });
-  return response.ok;
-}
-
-async function manualReminder(body) {
-  const [player] = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,email`);
-  const event = await getEvent(body.eventId);
-  if (!player || !event) return reply({ error: "Player or event not found." }, 404);
-  const sent = await sendEmail({
-    to: player.email,
-    subject: `Tennis payment reminder — ${event.event_date}`,
-    html: `<p>Hi ${player.name},</p><p>This is a reminder to clear your tennis payment for ${event.event_date}.</p><p>Payment PayID: 0420451170</p>`,
-  });
-  await db("reminder_log", {
-    method: "POST", headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ event_id: event.id, player_id: player.id, reminder_type: "manual" }),
-  });
-  return reply({ ok: true, emailSent: sent, message: sent ? "Reminder sent." : "Reminder logged; email provider is not configured or player has no email." });
 }
 
 export default async (req) => {
@@ -335,7 +315,7 @@ export default async (req) => {
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reminder"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-add-player", "admin-update-player", "admin-remove-player"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -344,7 +324,6 @@ export default async (req) => {
     if (action === "admin-add-player") return addPlayer(body);
     if (action === "admin-update-player") return updatePlayer(body);
     if (action === "admin-remove-player") return removePlayer(body);
-    if (action === "admin-reminder") return manualReminder(body);
   } catch (error) {
     console.error(error);
     return reply({ error: "The server could not complete that request." }, 500);
