@@ -31,6 +31,11 @@ create table if not exists public.events (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.deleted_event_dates (
+  event_date date primary key,
+  deleted_at timestamptz not null default now()
+);
+
 create table if not exists public.eois (
   event_id uuid not null references public.events(id) on delete cascade,
   player_id uuid not null references public.players(id) on delete cascade,
@@ -95,6 +100,7 @@ create table if not exists public.reminder_log (
 -- use the server-side service-role key, so exposed-table access stays closed.
 alter table public.players enable row level security;
 alter table public.events enable row level security;
+alter table public.deleted_event_dates enable row level security;
 alter table public.eois enable row level security;
 alter table public.payments enable row level security;
 alter table public.match_scores enable row level security;
