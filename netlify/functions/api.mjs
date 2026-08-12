@@ -186,17 +186,18 @@ async function savePasscode(passcode) {
 
 async function appState() {
   await ensureUpcomingEvents();
-  const [players, events, eois, payments, scores, liveMatches, mediaRows] = await Promise.all([
+  const [players, events, eois, payments, scores, liveMatches, notes, mediaRows] = await Promise.all([
     db("players?select=id,name,active&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
     db("match_scores?select=*&order=created_at.asc"),
     db("live_matches?select=*&order=updated_at.desc"),
+    db("event_notes?select=*"),
     db("media_items?select=*&order=captured_at.desc,created_at.desc"),
   ]);
   const media = mediaRows.map(item => ({ ...item, public_url: publicMediaUrl(item.storage_path) }));
-  return { players, events, eois, payments, scores, liveMatches, media, serverNow: new Date().toISOString() };
+  return { players, events, eois, payments, scores, liveMatches, notes, media, serverNow: new Date().toISOString() };
 }
 
 async function adminState() {
@@ -254,8 +255,45 @@ async function attendingSet(eventId, playerId) {
   return attending;
 }
 
+function liveSnapshot(match) {
+  return {
+    server_player_id: match.server_player_id,
+    server_order: match.server_order || [],
+    server_index: Number(match.server_index || 0),
+    needs_server_choice: !!match.needs_server_choice,
+    games_a: match.games_a,
+    games_b: match.games_b,
+    point_a: match.point_a,
+    point_b: match.point_b,
+    tiebreak_a: match.tiebreak_a,
+    tiebreak_b: match.tiebreak_b,
+    points_a: match.points_a,
+    points_b: match.points_b,
+    is_tiebreak: match.is_tiebreak,
+    completed: match.completed,
+  };
+}
+
+function liveHistory(match) {
+  return Array.isArray(match.point_history) ? match.point_history : [];
+}
+
+function buildServerOrder(teamA, teamB, teamAServerId, teamBServerId) {
+  const aFirst = teamA.includes(teamAServerId) ? teamAServerId : teamA[0];
+  const bFirst = teamB.includes(teamBServerId) ? teamBServerId : teamB[0];
+  return [aFirst, bFirst, teamA.find(id => id !== aFirst), teamB.find(id => id !== bFirst)].filter(Boolean);
+}
+
+function nextServer(match) {
+  const order = match.server_order || [];
+  if (!order.length) return { serverIndex: 0, serverId: match.server_player_id };
+  const serverIndex = (Number(match.server_index || 0) + 1) % order.length;
+  return { serverIndex, serverId: order[serverIndex] };
+}
+
 function liveAdvance(match, winner) {
   const next = { ...match };
+  let gameFinished = false;
   if (next.completed) return next;
   if (winner === "a") next.points_a++;
   else next.points_b++;
@@ -273,14 +311,21 @@ function liveAdvance(match, winner) {
   if (winner === "a") next.point_a++;
   else next.point_b++;
   if (next.point_a >= 4 && next.point_a - next.point_b >= 2) {
-    next.games_a++; next.point_a = 0; next.point_b = 0;
+    next.games_a++; next.point_a = 0; next.point_b = 0; gameFinished = true;
   }
   if (next.point_b >= 4 && next.point_b - next.point_a >= 2) {
-    next.games_b++; next.point_a = 0; next.point_b = 0;
+    next.games_b++; next.point_a = 0; next.point_b = 0; gameFinished = true;
   }
-  if (next.games_a === 3 && next.games_b === 3) next.is_tiebreak = true;
   if (next.games_a >= 4 && next.games_a - next.games_b >= 2) next.completed = true;
   if (next.games_b >= 4 && next.games_b - next.games_a >= 2) next.completed = true;
+  if (gameFinished && !next.completed) {
+    const server = nextServer(next);
+    next.server_index = server.serverIndex;
+    next.server_player_id = server.serverId;
+  }
+  if (next.games_a === 3 && next.games_b === 3) next.is_tiebreak = true;
+  next.needs_server_choice = false;
+  next.game_finished = gameFinished;
   return next;
 }
 
@@ -299,11 +344,15 @@ async function startLiveMatch(body) {
   if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4 || allPlayers.some(id => !attending.has(id))) {
     return reply({ error: "Choose four different players from this week’s In list." }, 400);
   }
-  if (!allPlayers.includes(body.serverPlayerId)) return reply({ error: "Choose the starting server." }, 400);
+  const teamAServerId = body.teamAServerId || body.serverPlayerId;
+  const teamBServerId = body.teamBServerId;
+  if (!teamA.includes(teamAServerId)) return reply({ error: "Choose Team 1’s first server." }, 400);
+  if (!teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
+  const serverOrder = buildServerOrder(teamA, teamB, teamAServerId, teamBServerId);
   await db("live_matches", {
     method: "POST",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: body.serverPlayerId, created_by: body.playerId }),
+    body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId }),
   });
   return reply({ ok: true });
 }
@@ -319,10 +368,12 @@ async function updateLiveServer(body) {
   if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
   const allPlayers = [...match.team_a_player_ids, ...match.team_b_player_ids];
   if (!allPlayers.includes(body.serverPlayerId)) return reply({ error: "Choose a server from this match." }, 400);
+  const serverOrder = match.server_order || [];
+  const serverIndex = serverOrder.includes(body.serverPlayerId) ? serverOrder.indexOf(body.serverPlayerId) : Number(match.server_index || 0);
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ server_player_id: body.serverPlayerId, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false, updated_at: new Date().toISOString() }),
   });
   return reply({ ok: true });
 }
@@ -338,7 +389,8 @@ async function addLivePoint(body) {
   if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
   const next = liveAdvance(match, body.winner);
-  const gameFinished = !next.completed && (next.games_a !== match.games_a || next.games_b !== match.games_b);
+  const history = [...liveHistory(match), liveSnapshot(match)].slice(-200);
+  const gameFinished = !!next.game_finished;
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
@@ -354,10 +406,37 @@ async function addLivePoint(body) {
       points_b: next.points_b,
       is_tiebreak: next.is_tiebreak,
       completed: next.completed,
+      server_index: next.server_index,
+      needs_server_choice: next.needs_server_choice,
+      point_history: history,
       updated_at: new Date().toISOString(),
     }),
   });
-  return reply({ ok: true, completed: next.completed, gameFinished, matchId: match.id });
+  return reply({ ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id });
+}
+
+async function undoLivePoint(body) {
+  const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
+  const match = rows?.[0];
+  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
+  const event = await getEvent(match.event_id);
+  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  if (windowError) return reply({ error: windowError }, 403);
+  const attending = await attendingSet(match.event_id, body.playerId);
+  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  const history = liveHistory(match);
+  const previous = history.at(-1);
+  if (!previous) return reply({ error: "There is no point to undo." }, 409);
+  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      ...previous,
+      point_history: history.slice(0, -1),
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  return reply({ ok: true });
 }
 
 async function abandonLiveMatch(body) {
@@ -452,6 +531,20 @@ async function submitScore(body) {
     body: JSON.stringify(inserts),
   });
   return reply({ ok: true, saved: inserts.length });
+}
+
+async function saveEventNote(body) {
+  const event = await getEvent(body.eventId);
+  if (!event || !body.playerId) return reply({ error: "Event or player not found." }, 404);
+  const attending = await attendingSet(body.eventId, body.playerId);
+  if (!attending) return reply({ error: "Only players marked In for this week can add notes." }, 403);
+  const note = String(body.note || "").trim().slice(0, 600);
+  await db("event_notes?on_conflict=event_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ event_id: body.eventId, note, updated_by: body.playerId, updated_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true });
 }
 
 async function adminLogin(body) {
@@ -682,8 +775,10 @@ export default async (req) => {
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body);
     if (req.method === "POST" && action === "live-server") return updateLiveServer(body);
     if (req.method === "POST" && action === "live-point") return addLivePoint(body);
+    if (req.method === "POST" && action === "live-undo") return undoLivePoint(body);
     if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body);
     if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body);
+    if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
     if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
