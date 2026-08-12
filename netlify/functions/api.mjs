@@ -88,12 +88,15 @@ function upcomingWednesdays() {
 }
 
 async function ensureUpcomingEvents() {
-  const events = upcomingWednesdays().map(event_date => ({ event_date }));
-  await db("events?on_conflict=event_date", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify(events),
-  });
+  const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
+  const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
+  if (events.length) {
+    await db("events?on_conflict=event_date", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(events),
+    });
+  }
   const now = datePartsInSydney();
   const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
   await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
@@ -298,6 +301,22 @@ async function saveEvent(body) {
   return reply({ ok: true });
 }
 
+async function deleteEvent(body) {
+  if (!body.eventId) return reply({ error: "Choose an event to delete." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Event not found." }, 404);
+  await db("deleted_event_dates?on_conflict=event_date", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ event_date: event.event_date, deleted_at: new Date().toISOString() }),
+  });
+  await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+  return reply({ ok: true });
+}
+
 async function addPlayer(body) {
   const name = String(body.name || "").trim();
   if (name.length < 2 || name.length > 80) return reply({ error: "Enter a valid player name." }, 400);
@@ -486,12 +505,13 @@ export default async (req) => {
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-delete-score", "admin-delete-media"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-delete-score", "admin-delete-media"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
     if (action === "admin-change-passcode") return changePasscode(body);
     if (action === "admin-save-event") return saveEvent(body);
+    if (action === "admin-delete-event") return deleteEvent(body);
     if (action === "admin-add-player") return addPlayer(body);
     if (action === "admin-update-player") return updatePlayer(body);
     if (action === "admin-remove-player") return removePlayer(body);
