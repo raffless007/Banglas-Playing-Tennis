@@ -160,7 +160,7 @@ create index if not exists media_items_captured_created_idx
   on public.media_items (captured_at desc, created_at desc);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('tennis-media', 'tennis-media', true, 104857600, array['image/*','video/*'])
+values ('tennis-media', 'tennis-media', true, 52428800, array['image/*','video/*'])
 on conflict (id) do update set
   public = excluded.public,
   file_size_limit = excluded.file_size_limit,
