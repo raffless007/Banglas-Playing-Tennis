@@ -13,7 +13,7 @@ const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET;
 const INITIAL_PASSCODE = process.env.INITIAL_ADMIN_PASSCODE || "1234";
 const SYDNEY = "Australia/Sydney";
 const MEDIA_BUCKET = "tennis-media";
-const MEDIA_MAX_BYTES = 1024 * 1024 * 1024;
+const MEDIA_MAX_BYTES = 100 * 1024 * 1024;
 const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -695,7 +695,7 @@ async function createMediaUpload(body) {
     return reply({ error: "Choose an image or video to upload." }, 400);
   }
   if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
-    return reply({ error: "Media files must be 1 GB or smaller." }, 400);
+    return reply({ error: "Media files must be 100 MB or smaller." }, 400);
   }
   const used = await mediaUsageBytes();
   if (used + fileSize > MEDIA_TOTAL_BYTES) {
@@ -725,7 +725,7 @@ async function finalizeMediaUpload(body) {
     return reply({ error: "Complete the media title and upload details." }, 400);
   }
   if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
-    return reply({ error: "Media files must be 1 GB or smaller." }, 400);
+    return reply({ error: "Media files must be 100 MB or smaller." }, 400);
   }
   if (!/^(image|video)\//.test(mimeType) || !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
     return reply({ error: "Invalid media type or date." }, 400);
