@@ -78,6 +78,8 @@ create table if not exists public.live_matches (
   team_a_player_ids uuid[] not null,
   team_b_player_ids uuid[] not null,
   server_player_id uuid references public.players(id),
+  server_order uuid[] not null default '{}',
+  server_index integer not null default 0,
   games_a integer not null default 0,
   games_b integer not null default 0,
   point_a integer not null default 0,
@@ -88,11 +90,20 @@ create table if not exists public.live_matches (
   points_b integer not null default 0,
   is_tiebreak boolean not null default false,
   completed boolean not null default false,
+  needs_server_choice boolean not null default false,
+  point_history jsonb not null default '[]'::jsonb,
   created_by uuid not null references public.players(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (cardinality(team_a_player_ids) = 2),
   check (cardinality(team_b_player_ids) = 2)
+);
+
+create table if not exists public.event_notes (
+  event_id uuid primary key references public.events(id) on delete cascade,
+  note text not null default '',
+  updated_by uuid references public.players(id),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.media_items (
@@ -130,6 +141,7 @@ alter table public.eois enable row level security;
 alter table public.payments enable row level security;
 alter table public.match_scores enable row level security;
 alter table public.live_matches enable row level security;
+alter table public.event_notes enable row level security;
 alter table public.media_items enable row level security;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
@@ -139,6 +151,9 @@ create index if not exists match_scores_event_created_idx
 
 create index if not exists live_matches_event_updated_idx
   on public.live_matches (event_id, completed, updated_at desc);
+
+create index if not exists event_notes_updated_idx
+  on public.event_notes (updated_at desc);
 
 create index if not exists media_items_captured_created_idx
   on public.media_items (captured_at desc, created_at desc);
