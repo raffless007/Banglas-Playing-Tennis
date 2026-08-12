@@ -338,10 +338,12 @@ async function addLivePoint(body) {
   if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
   const next = liveAdvance(match, body.winner);
+  const gameFinished = !next.completed && (next.games_a !== match.games_a || next.games_b !== match.games_b);
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({
+      server_player_id: next.server_player_id,
       games_a: next.games_a,
       games_b: next.games_b,
       point_a: next.point_a,
@@ -355,7 +357,7 @@ async function addLivePoint(body) {
       updated_at: new Date().toISOString(),
     }),
   });
-  return reply({ ok: true, completed: next.completed });
+  return reply({ ok: true, completed: next.completed, gameFinished, matchId: match.id });
 }
 
 async function abandonLiveMatch(body) {
