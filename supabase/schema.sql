@@ -63,7 +63,32 @@ create table if not exists public.match_scores (
   games_b integer not null check (games_b between 0 and 4),
   tiebreak_a integer,
   tiebreak_b integer,
+  points_a integer not null default 0,
+  points_b integer not null default 0,
   submitted_by uuid not null references public.players(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (cardinality(team_a_player_ids) = 2),
+  check (cardinality(team_b_player_ids) = 2)
+);
+
+create table if not exists public.live_matches (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  team_a_player_ids uuid[] not null,
+  team_b_player_ids uuid[] not null,
+  server_player_id uuid references public.players(id),
+  games_a integer not null default 0,
+  games_b integer not null default 0,
+  point_a integer not null default 0,
+  point_b integer not null default 0,
+  tiebreak_a integer not null default 0,
+  tiebreak_b integer not null default 0,
+  points_a integer not null default 0,
+  points_b integer not null default 0,
+  is_tiebreak boolean not null default false,
+  completed boolean not null default false,
+  created_by uuid not null references public.players(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (cardinality(team_a_player_ids) = 2),
@@ -104,6 +129,7 @@ alter table public.deleted_event_dates enable row level security;
 alter table public.eois enable row level security;
 alter table public.payments enable row level security;
 alter table public.match_scores enable row level security;
+alter table public.live_matches enable row level security;
 alter table public.media_items enable row level security;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
@@ -111,11 +137,14 @@ alter table public.reminder_log enable row level security;
 create index if not exists match_scores_event_created_idx
   on public.match_scores (event_id, created_at);
 
+create index if not exists live_matches_event_updated_idx
+  on public.live_matches (event_id, completed, updated_at desc);
+
 create index if not exists media_items_captured_created_idx
   on public.media_items (captured_at desc, created_at desc);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('tennis-media', 'tennis-media', true, 209715200, array['image/*','video/*'])
+values ('tennis-media', 'tennis-media', true, 1073741824, array['image/*','video/*'])
 on conflict (id) do update set
   public = excluded.public,
   file_size_limit = excluded.file_size_limit,
