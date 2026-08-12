@@ -14,6 +14,7 @@ const INITIAL_PASSCODE = process.env.INITIAL_ADMIN_PASSCODE || "1234";
 const SYDNEY = "Australia/Sydney";
 const MEDIA_BUCKET = "tennis-media";
 const MEDIA_MAX_BYTES = 1024 * 1024 * 1024;
+const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const headers = { "content-type": "application/json; charset=utf-8" };
@@ -59,6 +60,11 @@ function scoringWindowError(event) {
 function publicMediaUrl(path) {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
   return `${SUPABASE_URL}/storage/v1/object/public/${MEDIA_BUCKET}/${encoded}`;
+}
+
+async function mediaUsageBytes() {
+  const rows = await db("media_items?select=file_size");
+  return rows.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
 }
 
 async function db(path, options = {}) {
@@ -197,7 +203,8 @@ async function appState() {
     db("media_items?select=*&order=captured_at.desc,created_at.desc"),
   ]);
   const media = mediaRows.map(item => ({ ...item, public_url: publicMediaUrl(item.storage_path) }));
-  return { players, events, eois, payments, scores, liveMatches, notes, media, serverNow: new Date().toISOString() };
+  const mediaUsage = media.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
+  return { players, events, eois, payments, scores, liveMatches, notes, media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function adminState() {
@@ -690,6 +697,11 @@ async function createMediaUpload(body) {
   if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
     return reply({ error: "Media files must be 1 GB or smaller." }, 400);
   }
+  const used = await mediaUsageBytes();
+  if (used + fileSize > MEDIA_TOTAL_BYTES) {
+    const remainingMb = Math.max(0, Math.floor((MEDIA_TOTAL_BYTES - used) / 1024 / 1024));
+    return reply({ error: `This upload would exceed the 1 GB gallery limit. Remaining space: about ${remainingMb} MB.` }, 409);
+  }
   const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
   if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
   const extensionMatch = originalName.toLowerCase().match(/\.([a-z0-9]{1,10})$/);
@@ -707,9 +719,13 @@ async function finalizeMediaUpload(body) {
   const path = String(body.path || "");
   const originalName = String(body.originalName || "").trim();
   const mimeType = String(body.mimeType || "").toLowerCase();
+  const fileSize = Number(body.fileSize);
   const capturedAt = String(body.capturedAt || "");
   if (!body.playerId || title.length < 1 || title.length > 120 || !/^\d{4}\/\d{2}\/[a-f0-9-]+(?:\.[a-z0-9]{1,10})?$/.test(path)) {
     return reply({ error: "Complete the media title and upload details." }, 400);
+  }
+  if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
+    return reply({ error: "Media files must be 1 GB or smaller." }, 400);
   }
   if (!/^(image|video)\//.test(mimeType) || !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
     return reply({ error: "Invalid media type or date." }, 400);
@@ -720,9 +736,11 @@ async function finalizeMediaUpload(body) {
   const fileName = segments.pop();
   const folder = segments.join("/");
   const { data: stored, error } = await storageClient().storage.from(MEDIA_BUCKET).list(folder, { search: fileName, limit: 10 });
-  if (error || !stored?.some(item => item.name === fileName)) {
+  const storedItem = stored?.find(item => item.name === fileName);
+  if (error || !storedItem) {
     return reply({ error: "The uploaded file could not be verified." }, 409);
   }
+  const storedSize = Number(storedItem.metadata?.size || fileSize);
   await db("media_items", {
     method: "POST",
     headers: { Prefer: "return=minimal" },
@@ -733,6 +751,7 @@ async function finalizeMediaUpload(body) {
       storage_path: path,
       original_name: originalName.slice(0, 255),
       mime_type: mimeType,
+      file_size: storedSize,
       captured_at: capturedAt,
     }),
   });
