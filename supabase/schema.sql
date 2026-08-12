@@ -114,6 +114,7 @@ create table if not exists public.media_items (
   storage_path text not null unique,
   original_name text not null,
   mime_type text not null,
+  file_size bigint not null default 0,
   captured_at date not null default (now() at time zone 'Australia/Sydney')::date,
   created_at timestamptz not null default now()
 );
