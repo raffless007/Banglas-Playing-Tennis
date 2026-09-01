@@ -574,8 +574,10 @@ async function changePasscode(body) {
 }
 
 async function saveEvent(body) {
-  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed"];
+  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed"];
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
+  if ("court_1_name" in update) update.court_1_name = String(update.court_1_name || "Court 1").trim() || "Court 1";
+  if ("court_2_name" in update) update.court_2_name = String(update.court_2_name || "Court 2").trim() || "Court 2";
   update.updated_at = new Date().toISOString();
   await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
