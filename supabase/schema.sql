@@ -17,6 +17,7 @@ create table if not exists public.events (
   start_time time not null default '19:30',
   end_time time not null default '22:00',
   timezone text not null default 'Australia/Sydney',
+  court_1_name text not null default 'Court 1',
   location text not null default 'Civic Park Tennis Courts',
   suburb text not null default 'Pendle Hill',
   court_fee numeric(10,2) not null default 54.00,
