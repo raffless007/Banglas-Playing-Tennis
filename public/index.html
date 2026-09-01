@@ -86,7 +86,7 @@
       $('eventLocation').textContent=event.location;
       $('eventSuburb').textContent=event.suburb;
       $('court2Details').classList.toggle('hidden',!event.court_2_enabled);
-      $('court2Details').innerHTML=event.court_2_enabled?`<p class="eyebrow">ALL COURT DETAILS</p><div class="court-two-grid"><div><small>COURT</small><strong>Court 1</strong><em>${event.start_time.slice(0,5)} – ${event.end_time.slice(0,5)} · ${money(event.court_fee)}</em></div><div><small>COURT</small><strong>${esc(event.court_2_name||'Court 2')}</strong><em>${event.court_2_start_time.slice(0,5)} – ${event.court_2_end_time.slice(0,5)} · ${money(event.court_2_fee)}</em></div><div><small>TOTAL COURT COST</small><strong>${money(totalCourtFee(event))}</strong><em>${event.location}</em></div></div>`:'';
+      $('court2Details').innerHTML=event.court_2_enabled?`<p class="eyebrow">ALL COURT DETAILS</p><div class="court-two-grid"><div><small>COURT</small><strong>Court 1</strong><em>${event.start_time.slice(0,5)} – ${event.end_time.slice(0,5)}</em></div><div><small>COURT</small><strong>${esc(event.court_2_name||'Court 2')}</strong><em>${event.court_2_start_time.slice(0,5)} – ${event.court_2_end_time.slice(0,5)}</em></div></div>`:'';
       $('eventStatus').className='pill '+(open?'':'closed');
       $('eventStatus').textContent=sessionStatus(event).toUpperCase();
       $('deadline').textContent=`${open?'Closes':'Closed'} ${fmt(deadlineFor(event),{weekday:'short',hour:'numeric',minute:'2-digit'})}`;
