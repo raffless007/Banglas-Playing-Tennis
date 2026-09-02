@@ -336,19 +336,19 @@ function liveAdvance(match, winner) {
   return next;
 }
 
-async function startLiveMatch(body) {
+async function startLiveMatch(body, adminOverride = false) {
   const event = await getEvent(body.eventId);
   if (!event || !body.playerId) return reply({ error: "Event or player not found." }, 404);
   const windowError = scoringWindowError(event);
-  if (windowError) return reply({ error: windowError }, 403);
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(body.eventId, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   const active = await db(`live_matches?event_id=eq.${encodeURIComponent(body.eventId)}&select=id`);
   if (active.length) return reply({ error: "Finish or abandon the current live match first." }, 409);
   const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
   const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
   const allPlayers = [...teamA, ...teamB];
-  if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4 || allPlayers.some(id => !attending.has(id))) {
+  if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4 || (!adminOverride && allPlayers.some(id => !attending.has(id)))) {
     return reply({ error: "Choose four different players from this week’s In list." }, 400);
   }
   const teamAServerId = body.teamAServerId || body.serverPlayerId;
@@ -356,121 +356,123 @@ async function startLiveMatch(body) {
   if (!teamA.includes(teamAServerId)) return reply({ error: "Choose Team 1’s first server." }, 400);
   if (!teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
   const serverOrder = buildServerOrder(teamA, teamB, teamAServerId, teamBServerId);
-  await db("live_matches", {
+  const created = await db("live_matches?select=*", {
     method: "POST",
-    headers: { Prefer: "return=minimal" },
+    headers: { Prefer: "return=representation" },
     body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId }),
   });
-  return reply({ ok: true });
+  return reply({ ok: true, match: created?.[0] || null });
 }
 
-async function updateLiveServer(body) {
+async function updateLiveServer(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError) return reply({ error: windowError }, 403);
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   const allPlayers = [...match.team_a_player_ids, ...match.team_b_player_ids];
   if (!allPlayers.includes(body.serverPlayerId)) return reply({ error: "Choose a server from this match." }, 400);
   const serverOrder = match.server_order || [];
   const serverIndex = serverOrder.includes(body.serverPlayerId) ? serverOrder.indexOf(body.serverPlayerId) : Number(match.server_index || 0);
-  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
     method: "PATCH",
-    headers: { Prefer: "return=minimal" },
+    headers: { Prefer: "return=representation" },
     body: JSON.stringify({ server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false, updated_at: new Date().toISOString() }),
   });
-  return reply({ ok: true });
+  return reply({ ok: true, match: updated?.[0] || { ...match, server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false } });
 }
 
-async function addLivePoint(body) {
+async function addLivePoint(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError) return reply({ error: windowError }, 403);
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
   const next = liveAdvance(match, body.winner);
   const history = [...liveHistory(match), liveSnapshot(match)].slice(-200);
   const gameFinished = !!next.game_finished;
-  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
+  const patch = {
+    server_player_id: next.server_player_id,
+    games_a: next.games_a,
+    games_b: next.games_b,
+    point_a: next.point_a,
+    point_b: next.point_b,
+    tiebreak_a: next.tiebreak_a,
+    tiebreak_b: next.tiebreak_b,
+    points_a: next.points_a,
+    points_b: next.points_b,
+    is_tiebreak: next.is_tiebreak,
+    completed: next.completed,
+    server_index: next.server_index,
+    needs_server_choice: next.needs_server_choice,
+    point_history: history,
+    updated_at: new Date().toISOString(),
+  };
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
     method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({
-      server_player_id: next.server_player_id,
-      games_a: next.games_a,
-      games_b: next.games_b,
-      point_a: next.point_a,
-      point_b: next.point_b,
-      tiebreak_a: next.tiebreak_a,
-      tiebreak_b: next.tiebreak_b,
-      points_a: next.points_a,
-      points_b: next.points_b,
-      is_tiebreak: next.is_tiebreak,
-      completed: next.completed,
-      server_index: next.server_index,
-      needs_server_choice: next.needs_server_choice,
-      point_history: history,
-      updated_at: new Date().toISOString(),
-    }),
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify(patch),
   });
-  return reply({ ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id });
+  return reply({ ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id, match: updated?.[0] || { ...match, ...patch } });
 }
 
-async function undoLivePoint(body) {
-  const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
-  const match = rows?.[0];
-  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
-  const event = await getEvent(match.event_id);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError) return reply({ error: windowError }, 403);
-  const attending = await attendingSet(match.event_id, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
-  const history = liveHistory(match);
-  const previous = history.at(-1);
-  if (!previous) return reply({ error: "There is no point to undo." }, 409);
-  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({
-      ...previous,
-      point_history: history.slice(0, -1),
-      updated_at: new Date().toISOString(),
-    }),
-  });
-  return reply({ ok: true });
-}
-
-async function abandonLiveMatch(body) {
+async function undoLivePoint(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError) return reply({ error: windowError }, 403);
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  const history = liveHistory(match);
+  const previous = history.at(-1);
+  if (!previous) return reply({ error: "There is no point to undo." }, 409);
+  const patch = {
+    ...previous,
+    point_history: history.slice(0, -1),
+    updated_at: new Date().toISOString(),
+  };
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify(patch),
+  });
+  return reply({ ok: true, match: updated?.[0] || { ...match, ...patch } });
+}
+
+async function abandonLiveMatch(body, adminOverride = false) {
+  const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
+  const match = rows?.[0];
+  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
+  const event = await getEvent(match.event_id);
+  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
+  const attending = await attendingSet(match.event_id, body.playerId);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
     method: "DELETE",
     headers: { Prefer: "return=minimal" },
   });
-  return reply({ ok: true });
+  return reply({ ok: true, matchId: match.id });
 }
 
-async function finishLiveMatch(body) {
+async function finishLiveMatch(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError) return reply({ error: windowError }, 403);
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
-  if (!attending) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
   await db("match_scores", {
     method: "POST",
@@ -689,6 +691,43 @@ async function adminDeleteScore(body) {
   return reply({ ok: true });
 }
 
+async function adminUpdateScore(body) {
+  if (!body.scoreId) return reply({ error: "Score not found." }, 404);
+  const rows = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=id`);
+  if (!rows?.length) return reply({ error: "Score not found." }, 404);
+  const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
+  const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
+  const allPlayers = [...teamA, ...teamB];
+  if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4) {
+    return reply({ error: "Every doubles match needs four different players." }, 400);
+  }
+  const players = await db("players?select=id");
+  const rosterIds = new Set(players.map(player => player.id));
+  if (allPlayers.some(id => !rosterIds.has(id))) return reply({ error: "Choose players from the roster." }, 400);
+  const gamesA = Number(body.gamesA), gamesB = Number(body.gamesB);
+  const tiebreakA = body.tiebreakA === "" || body.tiebreakA == null ? null : Number(body.tiebreakA);
+  const tiebreakB = body.tiebreakB === "" || body.tiebreakB == null ? null : Number(body.tiebreakB);
+  const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB);
+  if (!checked.valid) return reply({ error: "Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-5 tie-break won by two." }, 400);
+  const pointsA = Math.max(0, Math.trunc(Number(body.pointsA) || 0));
+  const pointsB = Math.max(0, Math.trunc(Number(body.pointsB) || 0));
+  const updated = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      team_a_player_ids: teamA,
+      team_b_player_ids: teamB,
+      games_a: gamesA,
+      games_b: gamesB,
+      tiebreak_a: checked.tiebreakA,
+      tiebreak_b: checked.tiebreakB,
+      points_a: pointsA,
+      points_b: pointsB,
+    }),
+  });
+  return reply({ ok: true, score: updated?.[0] || null });
+}
+
 async function createMediaUpload(body) {
   const originalName = String(body.fileName || "").trim();
   const mimeType = String(body.mimeType || "").toLowerCase();
@@ -793,12 +832,12 @@ export default async (req) => {
     if (req.method === "POST" && action === "eoi") return submitEoi(body);
     if (req.method === "POST" && action === "paid") return markPaid(body);
     if (req.method === "POST" && action === "score") return submitScore(body);
-    if (req.method === "POST" && action === "live-start") return startLiveMatch(body);
-    if (req.method === "POST" && action === "live-server") return updateLiveServer(body);
-    if (req.method === "POST" && action === "live-point") return addLivePoint(body);
-    if (req.method === "POST" && action === "live-undo") return undoLivePoint(body);
-    if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body);
-    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body);
+    if (req.method === "POST" && action === "live-start") return startLiveMatch(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-server") return updateLiveServer(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-point") return addLivePoint(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-undo") return undoLivePoint(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body, isAdmin(req));
     if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
     if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
@@ -808,7 +847,7 @@ export default async (req) => {
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-delete-score", "admin-delete-media"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -820,6 +859,7 @@ export default async (req) => {
     if (action === "admin-remove-player") return removePlayer(body);
     if (action === "admin-set-eoi") return adminSetEoi(body);
     if (action === "admin-set-payment") return adminSetPayment(body);
+    if (action === "admin-update-score") return adminUpdateScore(body);
     if (action === "admin-delete-score") return adminDeleteScore(body);
     if (action === "admin-delete-media") return adminDeleteMedia(body);
   } catch (error) {
