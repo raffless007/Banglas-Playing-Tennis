@@ -9,6 +9,8 @@ create table if not exists public.players (
   email text,
   pin_hash text,
   pin_updated_at timestamptz,
+  pin_failed_attempts integer not null default 0,
+  pin_locked_at timestamptz,
   active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -30,6 +32,12 @@ create table if not exists public.events (
   court_2_fee numeric(10,2) not null default 0.00,
   ball_fee numeric(10,2) not null default 1.00,
   account_closed boolean not null default false,
+  max_players integer not null default 0,
+  cancellation_status text not null default 'scheduled',
+  cancellation_reason text,
+  recap_notes text,
+  award_player_id uuid references public.players(id),
+  template_name text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -43,6 +51,9 @@ create table if not exists public.eois (
   event_id uuid not null references public.events(id) on delete cascade,
   player_id uuid not null references public.players(id) on delete cascade,
   status text not null check (status in ('yes','no')),
+  waitlist_position integer,
+  attendance_status text not null default 'pending' check (attendance_status in ('pending','attended','late','no_show','substitute')),
+  checked_in_at timestamptz,
   updated_at timestamptz not null default now(),
   primary key (event_id, player_id)
 );
@@ -69,6 +80,10 @@ create table if not exists public.match_scores (
   points_a integer not null default 0,
   points_b integer not null default 0,
   submitted_by uuid not null references public.players(id),
+  live_match_id uuid,
+  started_at timestamptz,
+  ended_at timestamptz,
+  duration_seconds integer,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (cardinality(team_a_player_ids) = 2),
@@ -95,12 +110,21 @@ create table if not exists public.live_matches (
   completed boolean not null default false,
   needs_server_choice boolean not null default false,
   point_history jsonb not null default '[]'::jsonb,
+  version integer not null default 0,
+  started_at timestamptz,
+  ended_at timestamptz,
+  duration_seconds integer,
   created_by uuid not null references public.players(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (cardinality(team_a_player_ids) = 2),
   check (cardinality(team_b_player_ids) = 2)
 );
+
+alter table public.match_scores
+  drop constraint if exists match_scores_live_match_id_fkey,
+  add constraint match_scores_live_match_id_fkey
+    foreign key (live_match_id) references public.live_matches(id);
 
 create table if not exists public.event_notes (
   event_id uuid primary key references public.events(id) on delete cascade,
@@ -119,7 +143,26 @@ create table if not exists public.media_items (
   mime_type text not null,
   file_size bigint not null default 0,
   captured_at date not null default (now() at time zone 'Australia/Sydney')::date,
+  album text not null default 'General',
+  tags text[] not null default '{}',
+  is_favorite boolean not null default false,
+  consent_confirmed boolean not null default false,
+  reported_at timestamptz,
+  report_reason text,
   created_at timestamptz not null default now()
+);
+
+create table if not exists public.audit_log (
+  id uuid primary key default gen_random_uuid(), created_at timestamptz not null default now(),
+  actor_player_id uuid references public.players(id), actor_type text not null default 'system',
+  action text not null, target_type text, target_id uuid, outcome text not null default 'success',
+  details jsonb not null default '{}'::jsonb, before_state jsonb, after_state jsonb
+);
+
+create table if not exists public.event_templates (
+  id uuid primary key default gen_random_uuid(), name text not null unique,
+  created_by uuid references public.players(id), config jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
 
 create table if not exists public.app_settings (
@@ -169,16 +212,50 @@ alter table public.match_scores enable row level security;
 alter table public.live_matches enable row level security;
 alter table public.event_notes enable row level security;
 alter table public.media_items enable row level security;
+alter table public.audit_log enable row level security;
+alter table public.event_templates enable row level security;
+revoke all on table public.audit_log, public.event_templates from anon, authenticated;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
 alter table public.push_subscriptions enable row level security;
 alter table public.push_notification_log enable row level security;
+
+create or replace function public.record_player_pin_failure(target_player_id uuid)
+returns table(failed_attempts integer, pin_locked_at timestamptz)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+  update public.players
+  set pin_failed_attempts = least(coalesce(pin_failed_attempts, 0) + 1, 5),
+      pin_locked_at = case
+        when coalesce(pin_failed_attempts, 0) + 1 >= 5 then coalesce(pin_locked_at, now())
+        else pin_locked_at
+      end
+  where id = target_player_id
+    and active = true
+  returning public.players.pin_failed_attempts, public.players.pin_locked_at;
+end;
+$$;
+
+revoke all on function public.record_player_pin_failure(uuid) from public, anon, authenticated;
+grant execute on function public.record_player_pin_failure(uuid) to service_role;
 
 create index if not exists match_scores_event_created_idx
   on public.match_scores (event_id, created_at);
 
 create index if not exists live_matches_event_updated_idx
   on public.live_matches (event_id, completed, updated_at desc);
+
+create unique index if not exists live_matches_one_active_per_event_idx
+  on public.live_matches (event_id)
+  where completed = false;
+
+create unique index if not exists match_scores_live_match_id_unique
+  on public.match_scores (live_match_id)
+  where live_match_id is not null;
 
 create index if not exists event_notes_updated_idx
   on public.event_notes (updated_at desc);
@@ -197,9 +274,9 @@ create index if not exists push_notification_log_key_idx
   on public.push_notification_log (notification_key);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('tennis-media', 'tennis-media', true, 52428800, array['image/*','video/*'])
+values ('tennis-media', 'tennis-media', false, 52428800, array['image/*','video/*'])
 on conflict (id) do update set
-  public = excluded.public,
+  public = false,
   file_size_limit = excluded.file_size_limit,
   allowed_mime_types = excluded.allowed_mime_types;
 

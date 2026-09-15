@@ -68,9 +68,37 @@ function scoringWindowError(event) {
   return "";
 }
 
-function publicMediaUrl(path) {
-  const encoded = path.split("/").map(encodeURIComponent).join("/");
-  return `${SUPABASE_URL}/storage/v1/object/public/${MEDIA_BUCKET}/${encoded}`;
+async function mediaUrl(path) {
+  const { data, error } = await storageClient().storage.from(MEDIA_BUCKET).createSignedUrl(path, 3600);
+  if (error || !data?.signedUrl) return null;
+  return data.signedUrl;
+}
+
+function auditActor(req) {
+  if (isAdmin(req)) return { actor_type: "admin", actor_player_id: null };
+  const playerId = playerSessionSubject(req);
+  return { actor_type: playerId ? "player" : "anonymous", actor_player_id: playerId || null };
+}
+
+function auditSafe(value) {
+  if (!value || typeof value !== "object") return value;
+  const copy = Array.isArray(value) ? value.slice(0, 100) : { ...value };
+  for (const key of Object.keys(copy)) {
+    if (/passcode|pin|token|secret|signedurl|filedata/i.test(key)) delete copy[key];
+    else if (typeof copy[key] === "string") copy[key] = copy[key].slice(0, 500);
+  }
+  return copy;
+}
+
+async function writeAudit(req, action, body, outcome = "success", beforeState = null, afterState = null) {
+  try {
+    const actor = auditActor(req);
+    await db("audit_log", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({
+      ...actor, action, target_type: body?.eventId ? "event" : body?.playerId ? "player" : body?.mediaId ? "media" : body?.scoreId ? "score" : null,
+      target_id: body?.eventId || body?.playerId || body?.mediaId || body?.scoreId || null, outcome,
+      details: auditSafe(body || {}), before_state: auditSafe(beforeState), after_state: auditSafe(afterState),
+    }) });
+  } catch (error) { console.error("Audit log failed", error); }
 }
 
 async function mediaUsageBytes() {
@@ -179,6 +207,20 @@ function signPlayerSession(playerId) {
   return `${payload}.${signature}`;
 }
 
+function playerSessionSubject(req) {
+  const token = req.headers.get("x-player-session") || "";
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return null;
+  const expected = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString());
+    return session.type === "player" && session.sub && session.exp > Date.now() ? session.sub : null;
+  } catch {
+    return null;
+  }
+}
+
 function isAdmin(req) {
   const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const [payload, signature] = token.split(".");
@@ -222,25 +264,32 @@ async function savePasscode(passcode) {
   });
 }
 
-async function appState() {
+async function appState(req) {
   await ensureUpcomingEvents();
   const [players, events, eois, payments, scores, liveMatches, notes, mediaRows] = await Promise.all([
     db("players?select=id,name,active&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
-    db("eois?select=event_id,player_id,status,updated_at"),
+    db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
     db("match_scores?select=*&order=created_at.asc"),
     db("live_matches?select=*&order=updated_at.desc"),
     db("event_notes?select=*"),
     db("media_items?select=*&order=captured_at.desc,created_at.desc"),
   ]);
-  const media = mediaRows.map(item => ({ ...item, public_url: publicMediaUrl(item.storage_path) }));
+  const media = (await Promise.all(mediaRows.map(async item => ({ ...item, public_url: await mediaUrl(item.storage_path) })))).filter(item => item.public_url);
   const mediaUsage = media.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
-  return { players, events, eois, payments, scores, liveMatches, notes, media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  const admin = isAdmin(req);
+  const candidatePlayerId = admin ? null : playerSessionSubject(req);
+  const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
+  const visiblePayments = payments.map(payment => {
+    if (admin || payment.player_id === playerId) return payment;
+    return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
+  });
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function adminState() {
-  const players = await db("players?select=id,name,active,pin_hash&order=name.asc");
+  const players = await db("players?select=id,name,active,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc");
   return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash })) };
 }
 
@@ -266,9 +315,24 @@ async function createPlayerPin(body) {
 
 async function playerLogin(body) {
   const pin = String(body.pin || "");
-  const rows = await db(`players?id=eq.${encodeURIComponent(body.playerId || "")}&active=eq.true&select=id,pin_hash`);
+  const rows = await db(`players?id=eq.${encodeURIComponent(body.playerId || "")}&active=eq.true&select=id,pin_hash,pin_failed_attempts,pin_locked_at`);
   const player = rows?.[0];
-  if (!player || !player.pin_hash || !verifyPasscode(pin, player.pin_hash)) return reply({ error: "Incorrect PIN." }, 401);
+  if (!player || !player.pin_hash) return reply({ error: "Incorrect PIN." }, 401);
+  if (player.pin_locked_at) return reply({ error: "This player account is locked after 5 failed attempts. Please contact the admin to reset it." }, 423);
+  if (!verifyPasscode(pin, player.pin_hash)) {
+    const failures = await db("rpc/record_player_pin_failure", {
+      method: "POST",
+      body: JSON.stringify({ target_player_id: player.id }),
+    });
+    const count = Number(failures?.[0]?.failed_attempts || 0);
+    if (count >= 5) return reply({ error: "This player account is now locked after 5 failed attempts. Please contact the admin to reset it." }, 423);
+    return reply({ error: `Incorrect PIN. ${5 - count} attempt${5 - count === 1 ? "" : "s"} remaining.` }, 401);
+  }
+  await db(`players?id=eq.${encodeURIComponent(player.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ pin_failed_attempts: 0, pin_locked_at: null }),
+  });
   return reply({ ok: true, token: signPlayerSession(player.id) });
 }
 
@@ -319,19 +383,28 @@ async function submitEoi(body) {
   if (!event) return reply({ error: "Event not found." }, 404);
   const closesAt = new Date(localDateTimeToUtc(event.event_date, eventStartTime(event), event.timezone).getTime() - 6 * 60 * 60 * 1000);
   if (new Date() >= closesAt) return reply({ error: "The EOI deadline has passed." }, 409);
+  let waitlistPosition = null;
+  if (body.status === "yes" && Number(event.max_players || 0) > 0) {
+    const current = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
+    const alreadyIn = current.some(row => row.player_id === body.playerId);
+    if (!alreadyIn && current.length >= Number(event.max_players)) {
+      const waiting = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&waitlist_position=not.is.null&select=waitlist_position&order=waitlist_position.desc&limit=1`);
+      waitlistPosition = Number(waiting?.[0]?.waitlist_position || 0) + 1;
+    }
+  }
   await db("eois?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify({ event_id: body.eventId, player_id: body.playerId, status: body.status, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ event_id: body.eventId, player_id: body.playerId, status: body.status, waitlist_position: body.status === "yes" ? waitlistPosition : null, updated_at: new Date().toISOString() }),
   });
-  return reply({ ok: true });
+  return reply({ ok: true, waitlisted: Number.isInteger(waitlistPosition) });
 }
 
 async function markPaid(body) {
   const event = await getEvent(body.eventId);
   if (!event || !body.playerId) return reply({ error: "Event or player not found." }, 404);
   if (new Date() < localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) return reply({ error: "Payments open after the game finishes." }, 409);
-  const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&select=player_id`);
+  const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
   if (!attending.some(row => row.player_id === body.playerId)) return reply({ error: "Only players marked In can confirm payment." }, 403);
   const amount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
   await db("payments?on_conflict=event_id,player_id", {
@@ -358,7 +431,7 @@ function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB) {
 export { validTennisScore };
 
 async function attendingSet(eventId, playerId) {
-  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(eventId)}&status=eq.yes&select=player_id`);
+  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
   const attending = new Set(attendingRows.map(row => row.player_id));
   if (playerId && !attending.has(playerId)) return null;
   return attending;
@@ -458,11 +531,17 @@ async function startLiveMatch(body, adminOverride = false) {
   if (!teamA.includes(teamAServerId)) return reply({ error: "Choose Team 1’s first server." }, 400);
   if (!teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
   const serverOrder = buildServerOrder(teamA, teamB, teamAServerId, teamBServerId);
-  const created = await db("live_matches?select=*", {
-    method: "POST",
-    headers: { Prefer: "return=representation" },
-    body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId }),
-  });
+  let created;
+  try {
+    created = await db("live_matches?select=*", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, started_at: new Date().toISOString() }),
+    });
+  } catch (error) {
+    if (/duplicate|unique/i.test(error?.message || "")) return reply({ error: "Finish or abandon the current live match first." }, 409);
+    throw error;
+  }
   return reply({ ok: true, match: created?.[0] || null });
 }
 
@@ -479,11 +558,12 @@ async function updateLiveServer(body, adminOverride = false) {
   if (!allPlayers.includes(body.serverPlayerId)) return reply({ error: "Choose a server from this match." }, 400);
   const serverOrder = match.server_order || [];
   const serverIndex = serverOrder.includes(body.serverPlayerId) ? serverOrder.indexOf(body.serverPlayerId) : Number(match.server_index || 0);
-  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false, version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() }),
   });
+  if (!updated?.length) return reply({ error: "This match changed on another device. Refresh and try again." }, 409);
   return reply({ ok: true, match: updated?.[0] || { ...match, server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false } });
 }
 
@@ -515,13 +595,15 @@ async function addLivePoint(body, adminOverride = false) {
     server_index: next.server_index,
     needs_server_choice: next.needs_server_choice,
     point_history: history,
+    version: Number(match.version || 0) + 1,
     updated_at: new Date().toISOString(),
   };
-  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch),
   });
+  if (!updated?.length) return reply({ error: "This score changed on another device. Refresh and try again." }, 409);
   return reply({ ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id, match: updated?.[0] || { ...match, ...patch } });
 }
 
@@ -540,13 +622,15 @@ async function undoLivePoint(body, adminOverride = false) {
   const patch = {
     ...previous,
     point_history: history.slice(0, -1),
+    version: Number(match.version || 0) + 1,
     updated_at: new Date().toISOString(),
   };
-  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&select=*`, {
+  const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch),
   });
+  if (!updated?.length) return reply({ error: "This match changed on another device. Refresh and try again." }, 409);
   return reply({ ok: true, match: updated?.[0] || { ...match, ...patch } });
 }
 
@@ -569,29 +653,48 @@ async function abandonLiveMatch(body, adminOverride = false) {
 async function finishLiveMatch(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
-  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
+  if (!match || !body.playerId) {
+    const alreadySaved = await db(`match_scores?live_match_id=eq.${encodeURIComponent(body.matchId || "")}&select=id`);
+    if (alreadySaved?.length) return reply({ ok: true, alreadySaved: true });
+    return reply({ error: "Live match not found." }, 404);
+  }
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
-  await db("match_scores", {
-    method: "POST",
+  const endedAt = new Date().toISOString();
+  const durationSeconds = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(match.started_at || match.created_at).getTime()) / 1000));
+  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.true`, {
+    method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({
-      event_id: match.event_id,
-      team_a_player_ids: match.team_a_player_ids,
-      team_b_player_ids: match.team_b_player_ids,
-      games_a: match.games_a,
-      games_b: match.games_b,
-      tiebreak_a: match.is_tiebreak ? match.tiebreak_a : null,
-      tiebreak_b: match.is_tiebreak ? match.tiebreak_b : null,
-      points_a: match.points_a,
-      points_b: match.points_b,
-      submitted_by: body.playerId,
-    }),
+    body: JSON.stringify({ ended_at: endedAt, duration_seconds: durationSeconds, updated_at: endedAt }),
   });
+  try {
+    await db("match_scores", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        event_id: match.event_id,
+        team_a_player_ids: match.team_a_player_ids,
+        team_b_player_ids: match.team_b_player_ids,
+        games_a: match.games_a,
+        games_b: match.games_b,
+        tiebreak_a: match.is_tiebreak ? match.tiebreak_a : null,
+        tiebreak_b: match.is_tiebreak ? match.tiebreak_b : null,
+        points_a: match.points_a,
+        points_b: match.points_b,
+        submitted_by: body.playerId,
+        live_match_id: match.id,
+        started_at: match.started_at || match.created_at,
+        ended_at: endedAt,
+        duration_seconds: durationSeconds,
+      }),
+    });
+  } catch (error) {
+    if (!/duplicate|unique/i.test(error?.message || "")) throw error;
+  }
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
     method: "DELETE",
     headers: { Prefer: "return=minimal" },
@@ -604,7 +707,7 @@ async function submitScore(body) {
   if (!event || !body.submittedBy) return reply({ error: "Event or player not found." }, 404);
   const windowError = scoringWindowError(event);
   if (windowError) return reply({ error: windowError }, 403);
-  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&select=player_id`);
+  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
   const attending = new Set(attendingRows.map(row => row.player_id));
   if (!attending.has(body.submittedBy)) return reply({ error: "Only players marked In can enter scores." }, 403);
   const matches = Array.isArray(body.matches) ? body.matches : [body];
@@ -678,7 +781,7 @@ async function changePasscode(body) {
 }
 
 async function saveEvent(body) {
-  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed"];
+  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed", "max_players", "cancellation_status", "cancellation_reason", "recap_notes", "award_player_id", "template_name"];
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
   if ("court_1_name" in update) update.court_1_name = String(update.court_1_name || "Court 1").trim() || "Court 1";
   if ("court_2_name" in update) update.court_2_name = String(update.court_2_name || "Court 2").trim() || "Court 2";
@@ -692,7 +795,7 @@ async function saveEvent(body) {
   if (meaningful) {
     const updated = { ...before, ...update };
     try {
-      await notifyPlayers({ playerIds: await activePlayerIds(), notificationType: "session", notificationKey: `session-change:${updated.id}:${update.updated_at}`, eventId: updated.id, title: "Tennis session updated", body: `${eventLabel(updated)}: ${eventDetails(updated)}`, url: "/" });
+      await notifyPlayers({ playerIds: await activePlayerIds(), notificationType: "session", notificationKey: `session-change:${updated.id}:${update.updated_at}`, eventId: updated.id, title: "Tennis session updated", body: `${eventLabel(updated)}: ${eventDetails(updated)}`, url: `/?page=play&event=${encodeURIComponent(updated.id)}` });
     } catch (error) { console.error("Session push failed", error); }
   }
   return reply({ ok: true });
@@ -713,7 +816,7 @@ async function deleteEvent(body) {
     headers: { Prefer: "return=minimal" },
   });
   try {
-    await notifyPlayers({ playerIds, notificationType: "session", notificationKey: `session-cancelled:${event.id}`, eventId: event.id, title: "Tennis session cancelled", body: `${eventLabel(event)} at ${event.location} has been cancelled.`, url: "/" });
+    await notifyPlayers({ playerIds, notificationType: "session", notificationKey: `session-cancelled:${event.id}`, eventId: event.id, title: "Tennis session cancelled", body: `${eventLabel(event)} at ${event.location} has been cancelled.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
   } catch (error) { console.error("Cancellation push failed", error); }
   return reply({ ok: true });
 }
@@ -728,13 +831,13 @@ async function adminSendPush(body) {
   const playerIds = audience === "all"
     ? await activePlayerIds()
     : (await db(`eois?event_id=eq.${encodeURIComponent(event.id)}&status=eq.yes&select=player_id`)).map(row => row.player_id);
-  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-update:${event.id}:${Date.now()}`, eventId: event.id, title, body: message, url: "/?page=scores" });
+  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-update:${event.id}:${Date.now()}`, eventId: event.id, title, body: message, url: `/?page=scores&event=${encodeURIComponent(event.id)}` });
   return reply({ ok: true, sent: result.sent || 0 });
 }
 
 async function addPlayer(body) {
   const name = String(body.name || "").trim();
-  if (name.length < 2 || name.length > 80) return reply({ error: "Enter a valid player name." }, 400);
+  if (name.length < 2 || name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use letters, numbers, spaces, apostrophes or hyphens only for player names." }, 400);
   await db("players?on_conflict=name", {
     method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ name, active: true }),
@@ -754,7 +857,7 @@ async function resetPlayerPin(body) {
   await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ pin_hash: null, pin_updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ pin_hash: null, pin_updated_at: new Date().toISOString(), pin_failed_attempts: 0, pin_locked_at: null }),
   });
   return reply({ ok: true });
 }
@@ -779,6 +882,7 @@ async function adminSetEoi(body) {
       event_id: body.eventId,
       player_id: body.playerId,
       status: body.status,
+      waitlist_position: null,
       updated_at: new Date().toISOString(),
     }),
   });
@@ -904,6 +1008,7 @@ async function finalizeMediaUpload(body) {
   if (!body.playerId || title.length < 1 || title.length > 120 || !/^\d{4}\/\d{2}\/[a-f0-9-]+(?:\.[a-z0-9]{1,10})?$/.test(path)) {
     return reply({ error: "Complete the media title and upload details." }, 400);
   }
+  if (body.consentConfirmed !== true) return reply({ error: "Please confirm that everyone shown has consented to this upload." }, 400);
   if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MEDIA_MAX_BYTES) {
     return reply({ error: "Media files must be 50 MB or smaller." }, 400);
   }
@@ -933,8 +1038,35 @@ async function finalizeMediaUpload(body) {
       mime_type: mimeType,
       file_size: storedSize,
       captured_at: capturedAt,
+      album: String(body.album || "General").trim().slice(0, 80) || "General",
+      tags: Array.isArray(body.tags) ? body.tags.map(tag => String(tag).trim().slice(0, 30)).filter(Boolean).slice(0, 12) : [],
+      consent_confirmed: true,
     }),
   });
+  return reply({ ok: true });
+}
+
+async function reportMedia(body) {
+  const rows = await db(`media_items?id=eq.${encodeURIComponent(body.mediaId || "")}&select=id`);
+  if (!rows?.length) return reply({ error: "Media item not found." }, 404);
+  await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ reported_at: new Date().toISOString(), report_reason: String(body.reason || "Reported by player").slice(0, 240) }) });
+  return reply({ ok: true });
+}
+
+async function favoriteMedia(body) {
+  if (!body.mediaId || typeof body.favorite !== "boolean") return reply({ error: "Choose a media item." }, 400);
+  const rows = await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=id`);
+  if (!rows?.length) return reply({ error: "Media item not found." }, 404);
+  await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ is_favorite: body.favorite }) });
+  return reply({ ok: true });
+}
+
+async function deleteOwnMedia(body) {
+  const rows = await db(`media_items?id=eq.${encodeURIComponent(body.mediaId || "")}&player_id=eq.${encodeURIComponent(body.playerId || "")}&select=id,storage_path`);
+  const item = rows?.[0];
+  if (!item) return reply({ error: "You can only delete media that you uploaded." }, 403);
+  await storageClient().storage.from(MEDIA_BUCKET).remove([item.storage_path]);
+  await db(`media_items?id=eq.${encodeURIComponent(item.id)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
   return reply({ ok: true });
 }
 
@@ -952,12 +1084,57 @@ async function adminDeleteMedia(body) {
 
 async function updatePlayer(body) {
   const update = {};
-  if (typeof body.name === "string" && body.name.trim()) update.name = body.name.trim();
+  if (typeof body.name === "string" && body.name.trim()) {
+    const name = body.name.trim();
+    if (name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use letters, numbers, spaces, apostrophes or hyphens only for player names." }, 400);
+    update.name = name;
+  }
   if (!body.playerId || !Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
   await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
   });
   return reply({ ok: true });
+}
+
+async function adminAuditLog() {
+  const rows = await db("audit_log?select=*&order=created_at.desc&limit=200");
+  return reply({ ok: true, rows });
+}
+
+async function adminSetAttendance(body) {
+  if (!body.eventId || !body.playerId || !["pending", "attended", "late", "no_show", "substitute"].includes(body.attendanceStatus)) return reply({ error: "Choose a valid attendance status." }, 400);
+  await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ attendance_status: body.attendanceStatus, checked_in_at: body.attendanceStatus === "pending" ? null : new Date().toISOString(), updated_at: new Date().toISOString() }) });
+  return reply({ ok: true });
+}
+
+async function duplicateEvent(body) {
+  const source = await getEvent(body.eventId);
+  if (!source) return reply({ error: "Event not found." }, 404);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(body.newDate || "")) return reply({ error: "Choose a valid new date." }, 400);
+  const copy = { ...source, event_date: body.newDate, id: undefined, created_at: undefined, updated_at: new Date().toISOString(), account_closed: false };
+  delete copy.id; delete copy.created_at;
+  const created = await db("events", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(copy) });
+  return reply({ ok: true, event: created?.[0] || null });
+}
+
+async function runAudited(req, action, body, operation) {
+  let beforeState = null;
+  try {
+    if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
+    else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
+    else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
+    else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || null;
+  } catch { /* audit must never block the requested action */ }
+  const result = await operation();
+  let afterState = body?.changes || null;
+  try {
+    if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
+    else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
+    else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
+    else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || afterState;
+  } catch { /* ignore */ }
+  await writeAudit(req, action, body, result.status >= 400 ? "failed" : "success", beforeState, afterState);
+  return result;
 }
 
 export default async (req) => {
@@ -967,14 +1144,14 @@ export default async (req) => {
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
-    if (req.method === "GET" && action === "state") return reply(await appState());
+    if (req.method === "GET" && action === "state") return reply(await appState(req));
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
 
     if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "push-status", "push-subscribe", "push-unsubscribe"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -983,8 +1160,8 @@ export default async (req) => {
       }
     }
     if (req.method === "POST" && action === "eoi") return submitEoi(body);
-    if (req.method === "POST" && action === "paid") return markPaid(body);
-    if (req.method === "POST" && action === "score") return submitScore(body);
+    if (req.method === "POST" && action === "paid") return runAudited(req, action, body, () => markPaid(body));
+    if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body));
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body, isAdmin(req));
     if (req.method === "POST" && action === "live-server") return updateLiveServer(body, isAdmin(req));
     if (req.method === "POST" && action === "live-point") return addLivePoint(body, isAdmin(req));
@@ -994,6 +1171,9 @@ export default async (req) => {
     if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
     if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
+    if (req.method === "POST" && action === "media-report") return runAudited(req, action, body, () => reportMedia(body));
+    if (req.method === "POST" && action === "media-delete") return runAudited(req, action, body, () => deleteOwnMedia(body));
+    if (req.method === "POST" && action === "media-favorite") return runAudited(req, action, body, () => favoriteMedia(body));
     if (req.method === "POST" && action === "push-status") return pushStatus(body);
     if (req.method === "POST" && action === "push-subscribe") return savePushSubscription(body);
     if (req.method === "POST" && action === "push-unsubscribe") return disablePushSubscription(body);
@@ -1003,23 +1183,29 @@ export default async (req) => {
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push"].includes(action)) {
+    if (req.method === "GET" && action === "admin-audit-log") {
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
+      return adminAuditLog();
+    }
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
     if (action === "admin-change-passcode") return changePasscode(body);
-    if (action === "admin-save-event") return saveEvent(body);
-    if (action === "admin-delete-event") return deleteEvent(body);
-    if (action === "admin-add-player") return addPlayer(body);
-    if (action === "admin-update-player") return updatePlayer(body);
-    if (action === "admin-remove-player") return removePlayer(body);
-    if (action === "admin-reset-player-pin") return resetPlayerPin(body);
-    if (action === "admin-set-eoi") return adminSetEoi(body);
-    if (action === "admin-set-payment") return adminSetPayment(body);
-    if (action === "admin-update-score") return adminUpdateScore(body);
-    if (action === "admin-delete-score") return adminDeleteScore(body);
-    if (action === "admin-delete-media") return adminDeleteMedia(body);
-    if (action === "admin-send-push") return adminSendPush(body);
+    if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body));
+    if (action === "admin-delete-event") return runAudited(req, action, body, () => deleteEvent(body));
+    if (action === "admin-add-player") return runAudited(req, action, body, () => addPlayer(body));
+    if (action === "admin-update-player") return runAudited(req, action, body, () => updatePlayer(body));
+    if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
+    if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));
+    if (action === "admin-set-eoi") return runAudited(req, action, body, () => adminSetEoi(body));
+    if (action === "admin-set-attendance") return runAudited(req, action, body, () => adminSetAttendance(body));
+    if (action === "admin-set-payment") return runAudited(req, action, body, () => adminSetPayment(body));
+    if (action === "admin-update-score") return runAudited(req, action, body, () => adminUpdateScore(body));
+    if (action === "admin-delete-score") return runAudited(req, action, body, () => adminDeleteScore(body));
+    if (action === "admin-delete-media") return runAudited(req, action, body, () => adminDeleteMedia(body));
+    if (action === "admin-send-push") return runAudited(req, action, body, () => adminSendPush(body));
+    if (action === "admin-duplicate-event") return runAudited(req, action, body, () => duplicateEvent(body));
   } catch (error) {
     console.error(error);
     return reply({ error: "The server could not complete that request." }, 500);
