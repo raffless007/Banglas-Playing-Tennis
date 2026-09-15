@@ -7,6 +7,8 @@ create table if not exists public.players (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
   email text,
+  pin_hash text,
+  pin_updated_at timestamptz,
   active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -159,6 +161,10 @@ create index if not exists event_notes_updated_idx
 
 create index if not exists media_items_captured_created_idx
   on public.media_items (captured_at desc, created_at desc);
+
+create index if not exists players_active_pin_idx
+  on public.players (active)
+  where active = true;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('tennis-media', 'tennis-media', true, 52428800, array['image/*','video/*'])

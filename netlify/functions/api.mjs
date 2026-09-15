@@ -162,6 +162,12 @@ function signSession() {
   return `${payload}.${signature}`;
 }
 
+function signPlayerSession(playerId) {
+  const payload = Buffer.from(JSON.stringify({ type: "player", sub: playerId, iat: Date.now(), exp: Date.now() + 30 * 24 * 60 * 60 * 1000 })).toString("base64url");
+  const signature = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
 function isAdmin(req) {
   const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const [payload, signature] = token.split(".");
@@ -170,6 +176,21 @@ function isAdmin(req) {
   if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false;
   try { return JSON.parse(Buffer.from(payload, "base64url").toString()).exp > Date.now(); }
   catch { return false; }
+}
+
+async function isPlayer(req, playerId) {
+  const token = req.headers.get("x-player-session") || "";
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return false;
+  const expected = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString());
+    if (session.type !== "player" || session.sub !== playerId || session.exp <= Date.now()) return false;
+    const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=pin_updated_at`);
+    const pinUpdatedAt = Date.parse(rows?.[0]?.pin_updated_at || "");
+    return !!rows?.length && (!Number.isFinite(pinUpdatedAt) || pinUpdatedAt <= Number(session.iat || 0));
+  } catch { return false; }
 }
 
 async function getEvent(eventId) {
@@ -208,7 +229,36 @@ async function appState() {
 }
 
 async function adminState() {
-  return { players: await db("players?select=id,name,active&order=name.asc") };
+  const players = await db("players?select=id,name,active,pin_hash&order=name.asc");
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash })) };
+}
+
+async function playerPinStatus(body) {
+  const rows = await db(`players?id=eq.${encodeURIComponent(body.playerId || "")}&active=eq.true&select=id,pin_hash`);
+  const player = rows?.[0];
+  if (!player) return reply({ error: "Choose an active player." }, 404);
+  return reply({ ok: true, pinConfigured: !!player.pin_hash });
+}
+
+async function createPlayerPin(body) {
+  const pin = String(body.pin || "");
+  if (!body.playerId || !/^\d{4,8}$/.test(pin)) return reply({ error: "Use a PIN with 4–8 numbers." }, 400);
+  const now = new Date().toISOString();
+  const updated = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&pin_hash=is.null&select=id`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ pin_hash: passcodeHash(pin), pin_updated_at: now }),
+  });
+  if (!updated?.length) return reply({ error: "This player already has a PIN. Enter it to continue, or ask the admin to reset it." }, 409);
+  return reply({ ok: true, token: signPlayerSession(body.playerId) });
+}
+
+async function playerLogin(body) {
+  const pin = String(body.pin || "");
+  const rows = await db(`players?id=eq.${encodeURIComponent(body.playerId || "")}&active=eq.true&select=id,pin_hash`);
+  const player = rows?.[0];
+  if (!player || !player.pin_hash || !verifyPasscode(pin, player.pin_hash)) return reply({ error: "Incorrect PIN." }, 401);
+  return reply({ ok: true, token: signPlayerSession(player.id) });
 }
 
 async function submitEoi(body) {
@@ -620,6 +670,16 @@ async function removePlayer(body) {
   return reply({ ok: true });
 }
 
+async function resetPlayerPin(body) {
+  if (!body.playerId) return reply({ error: "Choose a player." }, 400);
+  await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ pin_hash: null, pin_updated_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true });
+}
+
 async function adminSetEoi(body) {
   if (!body.eventId || !body.playerId || !["yes", "no", "none"].includes(body.status)) {
     return reply({ error: "Choose a valid player and EOI status." }, 400);
@@ -829,6 +889,18 @@ export default async (req) => {
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
     if (req.method === "GET" && action === "state") return reply(await appState());
+    if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
+    if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
+    if (req.method === "POST" && action === "player-login") return playerLogin(body);
+
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize"];
+    if (playerActions.includes(action)) {
+      const playerId = body.playerId || body.submittedBy;
+      if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
+      if (!isAdmin(req) && !(await isPlayer(req, playerId))) {
+        return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
+      }
+    }
     if (req.method === "POST" && action === "eoi") return submitEoi(body);
     if (req.method === "POST" && action === "paid") return markPaid(body);
     if (req.method === "POST" && action === "score") return submitScore(body);
@@ -847,7 +919,7 @@ export default async (req) => {
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -857,6 +929,7 @@ export default async (req) => {
     if (action === "admin-add-player") return addPlayer(body);
     if (action === "admin-update-player") return updatePlayer(body);
     if (action === "admin-remove-player") return removePlayer(body);
+    if (action === "admin-reset-player-pin") return resetPlayerPin(body);
     if (action === "admin-set-eoi") return adminSetEoi(body);
     if (action === "admin-set-payment") return adminSetPayment(body);
     if (action === "admin-update-score") return adminUpdateScore(body);
