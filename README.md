@@ -65,9 +65,13 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase private service-role/secret key |
 | `ADMIN_SESSION_SECRET` | A long random value of at least 32 characters |
 | `INITIAL_ADMIN_PASSCODE` | The first 4–8 digit admin passcode |
+| `VAPID_PUBLIC_KEY` | Public Web Push VAPID key |
+| `VAPID_PRIVATE_KEY` | Private Web Push VAPID key — keep this secret |
+| `VAPID_SUBJECT` | A contact URI, e.g. `mailto:rsiddiquey@gmail.com` |
 
-Never put the service-role key in `public/index.html`, GitHub, or any browser
-code. After adding variables, trigger a new Netlify production deployment.
+Never put the service-role key or VAPID private key in `public/index.html`,
+GitHub, or any browser code. After adding variables, trigger a new Netlify
+production deployment.
 
 ## Rules implemented
 
@@ -99,10 +103,16 @@ code. After adding variables, trigger a new Netlify production deployment.
 - Admin sessions expire after eight hours.
 - Admin can override any player's EOI before or after the six-hour deadline.
 - Admin can rename roster players, correct paid/unpaid status and delete incorrect scores.
+- Players can enable mobile push notifications per device after entering their PIN.
+- Players can separately opt into payment, EOI, session and match/tournament updates.
+- The hourly push job sends EOI notices at 24 hours and one hour before the deadline,
+  plus payment notices when the session ends and after 48 hours if still unpaid.
+- Saving an event notifies opted-in players about session changes; deleting one sends a cancellation.
+- Admin can send one-off match or tournament announcements to players marked In or the full active roster.
 
 ## Important identity limitation
 
-Because players do not sign in, anyone with the public link can choose any
-roster name. That is the tradeoff for completely password-free player access.
-If stronger identity protection is later required, add a player PIN or email
-magic-link step.
+Players choose their roster name and use a personal PIN rather than a full
+account. The first person to claim an unconfigured roster name can set its PIN,
+so the admin should reset it if a name is claimed incorrectly. A future email
+or phone verification step would provide stronger identity proof.

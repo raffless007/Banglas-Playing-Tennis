@@ -136,6 +136,28 @@ create table if not exists public.reminder_log (
   sent_at timestamptz not null default now()
 );
 
+create table if not exists public.push_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  player_id uuid not null references public.players(id) on delete cascade,
+  endpoint text not null unique,
+  p256dh text not null,
+  auth text not null,
+  preferences jsonb not null default '{"payments":true,"eoi":true,"session":true,"matches":true}'::jsonb,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.push_notification_log (
+  id uuid primary key default gen_random_uuid(),
+  subscription_id uuid not null references public.push_subscriptions(id) on delete cascade,
+  notification_key text not null,
+  notification_type text not null,
+  event_id uuid,
+  sent_at timestamptz not null default now(),
+  unique (subscription_id, notification_key)
+);
+
 -- The browser never connects directly to these tables. Only Netlify Functions
 -- use the server-side service-role key, so exposed-table access stays closed.
 alter table public.players enable row level security;
@@ -149,6 +171,8 @@ alter table public.event_notes enable row level security;
 alter table public.media_items enable row level security;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
+alter table public.push_subscriptions enable row level security;
+alter table public.push_notification_log enable row level security;
 
 create index if not exists match_scores_event_created_idx
   on public.match_scores (event_id, created_at);
@@ -165,6 +189,12 @@ create index if not exists media_items_captured_created_idx
 create index if not exists players_active_pin_idx
   on public.players (active)
   where active = true;
+
+create index if not exists push_subscriptions_player_active_idx
+  on public.push_subscriptions (player_id, active);
+
+create index if not exists push_notification_log_key_idx
+  on public.push_notification_log (notification_key);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('tennis-media', 'tennis-media', true, 52428800, array['image/*','video/*'])

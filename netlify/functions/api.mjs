@@ -6,6 +6,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
+import { activePlayerIds, notifyPlayers, pushConfigured } from "./push.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -16,6 +17,7 @@ const MEDIA_BUCKET = "tennis-media";
 const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -41,6 +43,15 @@ function eventEndTime(event) {
 
 function totalCourtFee(event) {
   return Number(event.court_fee) + (event.court_2_enabled ? Number(event.court_2_fee || 0) : 0);
+}
+
+function eventLabel(event) {
+  return new Intl.DateTimeFormat("en-AU", { timeZone: SYDNEY, weekday: "short", day: "numeric", month: "short" }).format(new Date(`${event.event_date}T12:00:00Z`));
+}
+
+function eventDetails(event) {
+  const courtTwo = event.court_2_enabled ? ` · ${event.court_2_name || "Court 2"} ${event.court_2_start_time.slice(0, 5)}–${event.court_2_end_time.slice(0, 5)}` : "";
+  return `${event.location}, ${event.suburb} · ${event.court_1_name || "Court 1"} ${event.start_time.slice(0, 5)}–${event.end_time.slice(0, 5)}${courtTwo}`;
 }
 
 function scoringWindow(event) {
@@ -259,6 +270,47 @@ async function playerLogin(body) {
   const player = rows?.[0];
   if (!player || !player.pin_hash || !verifyPasscode(pin, player.pin_hash)) return reply({ error: "Incorrect PIN." }, 401);
   return reply({ ok: true, token: signPlayerSession(player.id) });
+}
+
+function normalisePushPreferences(preferences = {}) {
+  return {
+    payments: preferences.payments !== false,
+    eoi: preferences.eoi !== false,
+    session: preferences.session !== false,
+    matches: preferences.matches !== false,
+  };
+}
+
+async function pushStatus(body) {
+  if (!body.playerId) return reply({ error: "Choose your player profile first." }, 401);
+  const subscriptions = await db(`push_subscriptions?player_id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=preferences,updated_at&order=updated_at.desc&limit=1`);
+  return reply({ configured: pushConfigured(), enabled: !!subscriptions?.length, preferences: normalisePushPreferences(subscriptions?.[0]?.preferences || {}) });
+}
+
+async function savePushSubscription(body) {
+  const subscription = body.subscription || {};
+  const endpoint = String(subscription.endpoint || "");
+  const p256dh = String(subscription.keys?.p256dh || "");
+  const auth = String(subscription.keys?.auth || "");
+  if (!pushConfigured()) return reply({ error: "Push notifications are not configured yet." }, 503);
+  if (!body.playerId || !/^https:\/\//.test(endpoint) || !p256dh || !auth) return reply({ error: "This device could not be registered for notifications." }, 400);
+  await db("push_subscriptions?on_conflict=endpoint", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ player_id: body.playerId, endpoint, p256dh, auth, preferences: normalisePushPreferences(body.preferences), active: true, updated_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true });
+}
+
+async function disablePushSubscription(body) {
+  const endpoint = String(body.endpoint || "");
+  if (!body.playerId || !endpoint) return reply({ error: "This device could not be removed." }, 400);
+  await db(`push_subscriptions?player_id=eq.${encodeURIComponent(body.playerId)}&endpoint=eq.${encodeURIComponent(endpoint)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ active: false, updated_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true });
 }
 
 async function submitEoi(body) {
@@ -630,10 +682,19 @@ async function saveEvent(body) {
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
   if ("court_1_name" in update) update.court_1_name = String(update.court_1_name || "Court 1").trim() || "Court 1";
   if ("court_2_name" in update) update.court_2_name = String(update.court_2_name || "Court 2").trim() || "Court 2";
+  const before = await getEvent(body.eventId);
+  if (!before) return reply({ error: "Event not found." }, 404);
+  const meaningful = Object.keys(update).some(key => String(update[key]) !== String(before[key]));
   update.updated_at = new Date().toISOString();
   await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
   });
+  if (meaningful) {
+    const updated = { ...before, ...update };
+    try {
+      await notifyPlayers({ playerIds: await activePlayerIds(), notificationType: "session", notificationKey: `session-change:${updated.id}:${update.updated_at}`, eventId: updated.id, title: "Tennis session updated", body: `${eventLabel(updated)}: ${eventDetails(updated)}`, url: "/" });
+    } catch (error) { console.error("Session push failed", error); }
+  }
   return reply({ ok: true });
 }
 
@@ -641,6 +702,7 @@ async function deleteEvent(body) {
   if (!body.eventId) return reply({ error: "Choose an event to delete." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
+  const playerIds = await activePlayerIds();
   await db("deleted_event_dates?on_conflict=event_date", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -650,7 +712,24 @@ async function deleteEvent(body) {
     method: "DELETE",
     headers: { Prefer: "return=minimal" },
   });
+  try {
+    await notifyPlayers({ playerIds, notificationType: "session", notificationKey: `session-cancelled:${event.id}`, eventId: event.id, title: "Tennis session cancelled", body: `${eventLabel(event)} at ${event.location} has been cancelled.`, url: "/" });
+  } catch (error) { console.error("Cancellation push failed", error); }
   return reply({ ok: true });
+}
+
+async function adminSendPush(body) {
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Choose a valid event." }, 404);
+  const title = String(body.title || "Match update").trim().slice(0, 80);
+  const message = String(body.message || "").trim().slice(0, 240);
+  if (!message) return reply({ error: "Write the update first." }, 400);
+  const audience = body.audience === "all" ? "all" : "attending";
+  const playerIds = audience === "all"
+    ? await activePlayerIds()
+    : (await db(`eois?event_id=eq.${encodeURIComponent(event.id)}&status=eq.yes&select=player_id`)).map(row => row.player_id);
+  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-update:${event.id}:${Date.now()}`, eventId: event.id, title, body: message, url: "/?page=scores" });
+  return reply({ ok: true, sent: result.sent || 0 });
 }
 
 async function addPlayer(body) {
@@ -893,7 +972,9 @@ export default async (req) => {
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize"];
+    if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
+
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "push-status", "push-subscribe", "push-unsubscribe"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -913,13 +994,16 @@ export default async (req) => {
     if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
     if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
+    if (req.method === "POST" && action === "push-status") return pushStatus(body);
+    if (req.method === "POST" && action === "push-subscribe") return savePushSubscription(body);
+    if (req.method === "POST" && action === "push-unsubscribe") return disablePushSubscription(body);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
     if (req.method === "GET" && action === "admin-state") {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return reply(await adminState());
     }
 
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -935,6 +1019,7 @@ export default async (req) => {
     if (action === "admin-update-score") return adminUpdateScore(body);
     if (action === "admin-delete-score") return adminDeleteScore(body);
     if (action === "admin-delete-media") return adminDeleteMedia(body);
+    if (action === "admin-send-push") return adminSendPush(body);
   } catch (error) {
     console.error(error);
     return reply({ error: "The server could not complete that request." }, 500);

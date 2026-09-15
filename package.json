@@ -7,7 +7,8 @@
     "dev": "netlify dev"
   },
   "dependencies": {
-    "@supabase/supabase-js": "2.110.0"
+    "@supabase/supabase-js": "2.110.0",
+    "web-push": "3.6.7"
   },
   "devDependencies": {
     "netlify-cli": "^23.0.0"
