@@ -44,7 +44,8 @@ create table if not exists public.events (
 
 alter table public.players
   add column if not exists is_guest boolean not null default false,
-  add column if not exists guest_event_id uuid references public.events(id) on delete set null;
+  add column if not exists guest_event_id uuid references public.events(id) on delete set null,
+  add column if not exists guest_of_player_id uuid references public.players(id) on delete set null;
 
 alter table public.events
   add column if not exists guest_invite_token text unique;
@@ -57,6 +58,8 @@ create table if not exists public.guest_history (
   event_id uuid not null references public.events(id) on delete cascade,
   guest_name text not null,
   guest_email text,
+  guest_of_player_id uuid references public.players(id) on delete set null,
+  guest_of_name text,
   assigned_at timestamptz not null default now(),
   unique (event_id, guest_player_id)
 );

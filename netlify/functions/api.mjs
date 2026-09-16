@@ -292,7 +292,7 @@ async function savePasscode(passcode) {
 async function appState(req) {
   await ensureUpcomingEvents();
   const [players, events, eois, payments, scores, liveMatches, notes] = await Promise.all([
-    db("players?select=id,name,active,is_guest,guest_event_id&order=name.asc"),
+    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
@@ -329,7 +329,7 @@ async function eoiState() {
 
 async function adminState() {
   const [players, subscriptions] = await Promise.all([
-    db("players?select=id,name,active,email,is_guest,guest_event_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
+    db("players?select=id,name,active,email,is_guest,guest_event_id,guest_of_player_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=player_id&active=eq.true"),
   ]);
   let guestHistory = [];
@@ -953,16 +953,29 @@ function validGuestName(name) {
   return name.length >= 2 && name.length <= 80 && /^[\p{L}\p{N} .'-]+$/u.test(name);
 }
 
-async function createGuestParticipant({ eventId, name, email = null, status = "yes" }) {
-  const existingRows = await db(`players?name=eq.${encodeURIComponent(name)}&select=id,name,email,active,is_guest,guest_event_id`);
+async function resolveGuestOf(guestOfPlayerId) {
+  const id = String(guestOfPlayerId || "").trim();
+  if (!id) return { id: null, name: null };
+  const rows = await db(`players?id=eq.${encodeURIComponent(id)}&active=eq.true&is_guest=eq.false&select=id,name`);
+  if (!rows?.[0]) return { error: "Choose an active permanent member for Guest of." };
+  return { id: rows[0].id, name: rows[0].name };
+}
+
+async function createGuestParticipant({ eventId, name, email = null, status = "yes", guestOfPlayerId = undefined }) {
+  const guestOf = guestOfPlayerId === undefined ? undefined : await resolveGuestOf(guestOfPlayerId);
+  if (guestOf?.error) return { error: guestOf.error };
+  const existingRows = await db(`players?name=eq.${encodeURIComponent(name)}&select=id,name,email,active,is_guest,guest_event_id,guest_of_player_id`);
   let player = existingRows?.[0] || null;
   if (player) {
     if (!player.is_guest || player.guest_event_id !== eventId) {
       return { error: "That name is already on the main roster. Use a different guest name." };
     }
-    if (email && email !== player.email) {
+    const update = {};
+    if (email && email !== player.email) update.email = email;
+    if (guestOfPlayerId !== undefined) update.guest_of_player_id = guestOf.id;
+    if (Object.keys(update).length) {
       const updated = await db(`players?id=eq.${encodeURIComponent(player.id)}&select=id,name,email,active,is_guest,guest_event_id`, {
-        method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ email }),
+        method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(update),
       });
       player = updated?.[0] || player;
     }
@@ -970,7 +983,7 @@ async function createGuestParticipant({ eventId, name, email = null, status = "y
     const created = await db("players", {
       method: "POST",
       headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ name, email: email || null, active: true, is_guest: true, guest_event_id: eventId }),
+      body: JSON.stringify({ name, email: email || null, active: true, is_guest: true, guest_event_id: eventId, guest_of_player_id: guestOfPlayerId === undefined ? null : guestOf.id }),
     });
     player = created?.[0] || null;
   }
@@ -980,11 +993,11 @@ async function createGuestParticipant({ eventId, name, email = null, status = "y
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_id: eventId, player_id: player.id, status: status === "no" ? "no" : "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
   });
-  await recordGuestHistory(player, eventId);
+  await recordGuestHistory(player, eventId, guestOf);
   return { player };
 }
 
-async function recordGuestHistory(player, eventId) {
+async function recordGuestHistory(player, eventId, guestOf = undefined) {
   try {
     await db("guest_history?on_conflict=event_id,guest_player_id", {
       method: "POST",
@@ -994,6 +1007,7 @@ async function recordGuestHistory(player, eventId) {
         event_id: eventId,
         guest_name: player.name,
         guest_email: player.email || null,
+        ...(guestOf === undefined ? {} : { guest_of_player_id: guestOf.id || null, guest_of_name: guestOf.name || null }),
         assigned_at: new Date().toISOString(),
       }),
     });
@@ -1011,7 +1025,8 @@ async function addGuest(body) {
   const email = String(body.email || "").trim() || null;
   if (!validGuestName(name)) return reply({ error: "Use a guest name with 2–80 letters, numbers, spaces, apostrophes or hyphens." }, 400);
   if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
-  const result = await createGuestParticipant({ eventId: event.id, name, email, status: "yes" });
+  const guestOfPlayerId = Object.prototype.hasOwnProperty.call(body, "guestOfPlayerId") ? body.guestOfPlayerId : undefined;
+  const result = await createGuestParticipant({ eventId: event.id, name, email, status: "yes", guestOfPlayerId });
   if (result.error) return reply({ error: result.error }, 409);
   return reply({ ok: true, player: result.player });
 }
@@ -1316,25 +1331,51 @@ async function updateGuest(body) {
   if (!body.playerId) return reply({ error: "Choose a guest." }, 400);
   const guestRows = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,is_guest`);
   if (!guestRows?.length) return reply({ error: "That player is not in the guest archive." }, 404);
-  return updatePlayer(body);
+  const update = {};
+  if (typeof body.name === "string" && body.name.trim()) {
+    const name = body.name.trim();
+    if (name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use letters, numbers, spaces, apostrophes or hyphens only for guest names." }, 400);
+    update.name = name;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "email")) {
+    const email = String(body.email || "").trim();
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
+    update.email = email || null;
+  }
+  let guestOf;
+  if (Object.prototype.hasOwnProperty.call(body, "guestOfPlayerId")) {
+    guestOf = await resolveGuestOf(body.guestOfPlayerId);
+    if (guestOf.error) return reply({ error: guestOf.error }, 400);
+    update.guest_of_player_id = guestOf.id;
+  }
+  if (!Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
+  await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
+    method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
+  });
+  return reply({ ok: true });
 }
 
 async function assignGuest(body) {
   if (!body.playerId || !body.eventId) return reply({ error: "Choose a guest and a week." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
-  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,email,active,is_guest,guest_event_id`);
+  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,email,active,is_guest,guest_event_id,guest_of_player_id`);
   const guest = guests?.[0];
   if (!guest) return reply({ error: "Choose a guest from the archive." }, 404);
+  const guestOfPlayerId = Object.prototype.hasOwnProperty.call(body, "guestOfPlayerId") ? body.guestOfPlayerId : undefined;
+  const guestOf = guestOfPlayerId === undefined ? undefined : await resolveGuestOf(guestOfPlayerId);
+  if (guestOf?.error) return reply({ error: guestOf.error }, 400);
+  const playerUpdate = { active: true, guest_event_id: event.id };
+  if (guestOfPlayerId !== undefined) playerUpdate.guest_of_player_id = guestOf.id;
   await db(`players?id=eq.${encodeURIComponent(guest.id)}`, {
-    method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ active: true, guest_event_id: event.id }),
+    method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(playerUpdate),
   });
   await db("eois?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_id: event.id, player_id: guest.id, status: "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
   });
-  await recordGuestHistory(guest, event.id);
+  await recordGuestHistory(guest, event.id, guestOf);
   return reply({ ok: true, playerId: guest.id, eventId: event.id });
 }
 
