@@ -182,6 +182,13 @@ create table if not exists public.media_items (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.media_favourites (
+  player_id uuid not null references public.players(id) on delete cascade,
+  media_id uuid not null references public.media_items(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (player_id, media_id)
+);
+
 create table if not exists public.audit_log (
   id uuid primary key default gen_random_uuid(), created_at timestamptz not null default now(),
   actor_player_id uuid references public.players(id), actor_type text not null default 'system', actor_name text,
@@ -329,9 +336,11 @@ alter table public.match_scores enable row level security;
 alter table public.live_matches enable row level security;
 alter table public.event_notes enable row level security;
 alter table public.media_items enable row level security;
+alter table public.media_favourites enable row level security;
 alter table public.audit_log enable row level security;
 alter table public.event_templates enable row level security;
 revoke all on table public.audit_log, public.event_templates from anon, authenticated;
+revoke all on table public.media_favourites from anon, authenticated;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
 alter table public.push_subscriptions enable row level security;
@@ -390,6 +399,9 @@ create index if not exists event_notes_updated_idx
 
 create index if not exists media_items_captured_created_idx
   on public.media_items (captured_at desc, created_at desc);
+
+create index if not exists media_favourites_media_idx
+  on public.media_favourites (media_id);
 
 create index if not exists players_active_pin_idx
   on public.players (active)

@@ -385,9 +385,14 @@ async function appState(req) {
   return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
-async function mediaState() {
+async function mediaState(req) {
   const rows = await db("media_items?select=*&order=captured_at.desc,created_at.desc");
-  const media = (await Promise.all(rows.map(async item => ({ ...item, public_url: await mediaUrl(item.storage_path) })))).filter(item => item.public_url);
+  const playerId = isAdmin(req) ? null : playerSessionSubject(req);
+  const favouriteRows = playerId
+    ? await db(`media_favourites?player_id=eq.${encodeURIComponent(playerId)}&select=media_id`).catch(() => [])
+    : [];
+  const favouriteIds = new Set((favouriteRows || []).map(row => row.media_id));
+  const media = (await Promise.all(rows.map(async item => ({ ...item, is_favorite: favouriteIds.has(item.id), public_url: await mediaUrl(item.storage_path) })))).filter(item => item.public_url);
   const mediaUsage = media.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
   return reply({ media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() });
 }
@@ -1608,7 +1613,19 @@ async function favoriteMedia(body) {
   if (!body.mediaId || typeof body.favorite !== "boolean") return reply({ error: "Choose a media item." }, 400);
   const rows = await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=id`);
   if (!rows?.length) return reply({ error: "Media item not found." }, 404);
-  await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ is_favorite: body.favorite }) });
+  try {
+    if (body.favorite) {
+      await db("media_favourites", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+        body: JSON.stringify({ player_id: body.playerId, media_id: body.mediaId }),
+      });
+    } else {
+      await db(`media_favourites?player_id=eq.${encodeURIComponent(body.playerId)}&media_id=eq.${encodeURIComponent(body.mediaId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+    }
+  } catch {
+    return reply({ error: "Favorites are not ready yet. Apply 032_media_favourites.sql in Supabase." }, 503);
+  }
   return reply({ ok: true });
 }
 
@@ -1803,7 +1820,7 @@ export default async (req) => {
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
     if (req.method === "GET" && action === "state") return reply(await appState(req));
-    if (req.method === "GET" && action === "media-state") return mediaState();
+    if (req.method === "GET" && action === "media-state") return mediaState(req);
     if (req.method === "GET" && action === "live-state") return liveState();
     if (req.method === "GET" && action === "eoi-state") return eoiState();
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
