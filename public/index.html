@@ -34,6 +34,26 @@
   </style>
   <style>.audit-row{display:flex;justify-content:space-between;gap:14px;border-top:1px solid var(--line);padding:13px 0;align-items:flex-start}.audit-row pre{white-space:pre-wrap;max-width:460px;font-size:10px;background:#f3f4ed;padding:10px;border-radius:8px}.media-meta{font-size:10px;color:var(--muted);margin-top:6px}.waitlist{color:var(--warn);font-weight:850}.server-now{display:flex;align-items:center;gap:5px}.server-pointer{color:var(--lime);font-weight:950;display:inline-block;transform:translateY(-1px)}.alert-log{overflow:hidden}.alert-log-header{padding:25px 28px;border-bottom:1px solid var(--line)}.alert-list{padding:0 28px}.alert-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:24px;padding:22px 0;border-bottom:1px solid var(--line)}.alert-entry:last-child{border-bottom:0}.alert-title{font-size:17px}.alert-meta{font-size:11px;color:var(--muted);margin:7px 0}.alert-body{font-size:12px;line-height:1.5;color:#52665f;margin:0;white-space:pre-wrap}.alert-stats{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}.alert-stat{background:#f3f4ed;border-radius:999px;padding:6px 9px;font-size:10px;color:#5f746b}.alert-status{align-self:start;white-space:nowrap;min-width:0}.alert-entry details{margin-top:14px}.alert-entry summary{cursor:pointer;color:var(--green);font-size:11px;font-weight:850}.alert-entry details .rosterrow{font-size:11px}.alert-empty{padding:30px 0;color:var(--muted)}
 </style>
+<style>
+  /* Keep player names visible while the wide leaderboard scrolls horizontally on mobile. */
+  #leaderboard table th:nth-child(2),
+  #leaderboard table td:nth-child(2),
+  [data-guest-pane="leaderboard"] table th:nth-child(2),
+  [data-guest-pane="leaderboard"] table td:nth-child(2) {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    min-width: 170px;
+    white-space: nowrap;
+    background: var(--card);
+    box-shadow: 2px 0 0 var(--line);
+  }
+
+  #leaderboard table thead th:nth-child(2),
+  [data-guest-pane="leaderboard"] table thead th:nth-child(2) {
+    z-index: 4;
+  }
+</style>
 </head>
 <body>
   <div id="loading" class="loading">Loading the clubhouse…</div>
