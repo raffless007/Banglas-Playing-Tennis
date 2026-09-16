@@ -16,6 +16,7 @@ const SYDNEY = "Australia/Sydney";
 const MEDIA_BUCKET = "tennis-media";
 const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 // The app currently has one shared admin passcode. Set ADMIN_DISPLAY_NAME in
@@ -291,8 +292,8 @@ async function savePasscode(passcode) {
 
 async function appState(req) {
   await ensureUpcomingEvents();
-  const [players, events, eois, payments, scores, liveMatches, notes] = await Promise.all([
-    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id&order=name.asc"),
+  const [playerRows, events, eois, payments, scores, liveMatches, notes] = await Promise.all([
+    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
@@ -303,6 +304,16 @@ async function appState(req) {
   const admin = isAdmin(req);
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
   const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
+  const players = await Promise.all((playerRows || []).map(async player => ({
+    id: player.id,
+    name: player.name,
+    active: player.active,
+    is_guest: player.is_guest,
+    guest_event_id: player.guest_event_id,
+    guest_of_player_id: player.guest_of_player_id,
+    avatar_url: player.avatar_path ? await mediaUrl(player.avatar_path) : null,
+    ...(admin || player.id === playerId ? { email: player.email || "", mobile: player.mobile || "", address: player.address || "" } : {}),
+  })));
   const visiblePayments = payments.map(payment => {
     if (admin || payment.player_id === playerId) return payment;
     return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
@@ -1270,6 +1281,76 @@ async function createMediaUpload(body) {
   return reply({ ok: true, path, signedUrl: data.signedUrl });
 }
 
+async function createPlayerAvatarUpload(body) {
+  const originalName = String(body.fileName || "").trim();
+  const mimeType = String(body.mimeType || "").toLowerCase();
+  const fileSize = Number(body.fileSize);
+  if (!body.playerId || !originalName || !/^image\//.test(mimeType)) return reply({ error: "Choose an image for your display picture." }, 400);
+  if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > AVATAR_MAX_BYTES) return reply({ error: "Display pictures must be 5 MB or smaller." }, 400);
+  const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
+  if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
+  const mimeExtensions = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic", "image/heif": ".heif" };
+  const extensionMatch = originalName.toLowerCase().match(/\.([a-z0-9]{1,10})$/);
+  const extension = extensionMatch ? `.${extensionMatch[1]}` : (mimeExtensions[mimeType] || ".img");
+  const path = `avatars/${body.playerId}/${randomUUID()}${extension}`;
+  const { data, error } = await storageClient().storage.from(MEDIA_BUCKET).createSignedUploadUrl(path);
+  if (error || !data?.signedUrl) throw error || new Error("Could not create the avatar upload URL.");
+  return reply({ ok: true, path, signedUrl: data.signedUrl });
+}
+
+async function updatePlayerProfile(body) {
+  const playerId = String(body.playerId || "");
+  if (!playerId) return reply({ error: "Choose your player profile first." }, 400);
+  const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=id,name,email,mobile,address,avatar_path`);
+  const existing = rows?.[0];
+  if (!existing) return reply({ error: "Active player profile not found." }, 404);
+  const update = {};
+  if (typeof body.name === "string") {
+    const name = body.name.trim();
+    if (name.length < 2 || name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use 2–80 letters, numbers, spaces, apostrophes or hyphens for your name." }, 400);
+    update.name = name;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "email")) {
+    const email = String(body.email || "").trim();
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
+    update.email = email || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "mobile")) {
+    const mobile = String(body.mobile || "").trim();
+    if (mobile && !/^[0-9+() .-]{6,24}$/.test(mobile)) return reply({ error: "Enter a valid mobile number, or leave it blank." }, 400);
+    update.mobile = mobile || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "address")) {
+    const address = String(body.address || "").trim();
+    if (address.length > 200) return reply({ error: "Address must be 200 characters or fewer." }, 400);
+    update.address = address || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "avatarPath")) {
+    const path = String(body.avatarPath || "").trim();
+    const avatarPrefix = `avatars/${playerId}/`;
+    if (path && (!path.startsWith(avatarPrefix) || !/^[a-f0-9-]+\.[a-z0-9]{1,10}$/i.test(path.slice(avatarPrefix.length)))) return reply({ error: "That display picture upload is invalid." }, 400);
+    if (path) {
+      const segments = path.split("/");
+      const fileName = segments.pop();
+      const folder = segments.join("/");
+      const { data: stored, error } = await storageClient().storage.from(MEDIA_BUCKET).list(folder, { search: fileName, limit: 10 });
+      if (error || !stored?.some(item => item.name === fileName)) return reply({ error: "The uploaded display picture could not be verified." }, 409);
+    }
+    update.avatar_path = path || null;
+  }
+  if (!Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
+  if (update.name && update.name !== existing.name) {
+    const conflicts = await db(`players?name=eq.${encodeURIComponent(update.name)}&id=neq.${encodeURIComponent(playerId)}&select=id`);
+    if (conflicts?.length) return reply({ error: "That player name is already in use. Choose another name." }, 409);
+  }
+  await db(`players?id=eq.${encodeURIComponent(playerId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update) });
+  if (update.avatar_path && existing.avatar_path && update.avatar_path !== existing.avatar_path) {
+    await storageClient().storage.from(MEDIA_BUCKET).remove([existing.avatar_path]).catch(() => {});
+  }
+  const player = { ...existing, ...update, avatar_url: update.avatar_path ? await mediaUrl(update.avatar_path) : null };
+  return reply({ ok: true, player });
+}
+
 async function finalizeMediaUpload(body) {
   const title = String(body.title || "").trim();
   const path = String(body.path || "");
@@ -1494,7 +1575,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
       else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
       else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
-      else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || null;
+      else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || null;
     } catch { /* audit must never block the requested action */ }
   }
   const result = await operation();
@@ -1504,7 +1585,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
       else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
       else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
-      else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || afterState;
+      else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || afterState;
     } catch { /* ignore */ }
   }
   await writeAudit(req, action, body, result.status >= 400 ? "failed" : "success", beforeState, afterState);
@@ -1530,7 +1611,7 @@ export default async (req) => {
 
     if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -1556,6 +1637,8 @@ export default async (req) => {
     if (req.method === "POST" && action === "push-status") return pushStatus(body);
     if (req.method === "POST" && action === "push-subscribe") return savePushSubscription(body);
     if (req.method === "POST" && action === "push-unsubscribe") return disablePushSubscription(body);
+    if (req.method === "POST" && action === "player-avatar-upload-url") return createPlayerAvatarUpload(body);
+    if (req.method === "POST" && action === "player-update-profile") return runAudited(req, action, body, () => updatePlayerProfile(body));
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
     if (req.method === "GET" && action === "admin-state") {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
