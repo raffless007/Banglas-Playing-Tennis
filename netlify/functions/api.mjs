@@ -154,8 +154,8 @@ async function writeAudit(req, action, body, outcome = "success", beforeState = 
   try {
     const actor = await auditActor(req);
     const payload = {
-      ...actor, action, target_type: body?.eventId ? "event" : body?.playerId ? "player" : body?.mediaId ? "media" : body?.scoreId ? "score" : null,
-      target_id: body?.eventId || body?.playerId || body?.mediaId || body?.scoreId || null, outcome,
+      ...actor, action, target_type: body?.eventId ? "event" : body?.playerId ? "player" : body?.mediaId ? "media" : body?.scoreId ? "score" : body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action)) ? "badge" : null,
+      target_id: body?.eventId || body?.playerId || body?.mediaId || body?.scoreId || body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action) ? body.id : null), outcome,
       details: auditSafe(body || {}), before_state: auditSafe(beforeState), after_state: auditSafe(afterState),
     };
     try {
@@ -342,7 +342,7 @@ async function savePasscode(passcode) {
 
 async function appState(req) {
   await ensureUpcomingEvents();
-  const [playerRows, events, eois, payments, scores, liveMatches, notes] = await Promise.all([
+  const [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
@@ -350,6 +350,7 @@ async function appState(req) {
     db("match_scores?select=*&order=created_at.asc"),
     db("live_matches?select=*&order=updated_at.desc"),
     db("event_notes?select=*"),
+    db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
   const admin = isAdmin(req);
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
@@ -381,7 +382,7 @@ async function appState(req) {
     await createPlayerNotifications(pending).catch(() => {});
   }
   const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
-  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, notifications, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function mediaState() {
@@ -402,9 +403,10 @@ async function eoiState() {
 }
 
 async function adminState() {
-  const [players, subscriptions] = await Promise.all([
+  const [players, subscriptions, badges] = await Promise.all([
     db("players?select=id,name,active,email,is_guest,guest_event_id,guest_of_player_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=player_id&active=eq.true"),
+    db("badges?select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
   let guestHistory = [];
   try {
@@ -414,7 +416,63 @@ async function adminState() {
     // existing roster controls usable until it is run.
   }
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
-  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })), guestHistory };
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })), guestHistory, badges };
+}
+
+function badgePayload(body) {
+  const name = String(body.name || "").trim();
+  if (name.length < 2 || name.length > 60) return { error: "Badge names must be 2–60 characters." };
+  const description = String(body.description || "").trim();
+  if (description.length > 200) return { error: "Badge descriptions must be 200 characters or fewer." };
+  const integer = (value, label, min = 0) => {
+    if (value === "" || value === null || value === undefined) return null;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < min || number > 100000) throw new Error(`${label} must be a whole number.`);
+    return number;
+  };
+  const decimal = (value, label) => {
+    if (value === "" || value === null || value === undefined) return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0 || number > 100) throw new Error(`${label} must be between 0 and 100.`);
+    return number;
+  };
+  let minPlayed, minWins, minAttendance, minPointDiff, minWinPct, minPaidRate;
+  try {
+    minPlayed = integer(body.minPlayed, "Minimum matches played");
+    minWins = integer(body.minWins, "Minimum wins");
+    minAttendance = integer(body.minAttendance, "Minimum sessions attended");
+    minPointDiff = body.minPointDiff === "" || body.minPointDiff === null || body.minPointDiff === undefined ? null : Number(body.minPointDiff);
+    if (minPointDiff !== null && (!Number.isInteger(minPointDiff) || minPointDiff < -100000 || minPointDiff > 100000)) throw new Error("Minimum point differential must be a whole number.");
+    minWinPct = decimal(body.minWinPct, "Minimum win percentage");
+    minPaidRate = decimal(body.minPaidRate, "Minimum payment completion percentage");
+  } catch (error) { return { error: error.message }; }
+  const fallbackType = ["played", "no_played"].includes(body.fallbackType) ? body.fallbackType : null;
+  const sortOrder = Number.isInteger(Number(body.sortOrder)) ? Math.max(0, Math.min(10000, Number(body.sortOrder))) : 100;
+  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
+}
+
+async function saveBadge(body) {
+  const parsed = badgePayload(body);
+  if (parsed.error) return reply({ error: parsed.error }, 400);
+  const payload = parsed.value;
+  try {
+    if (body.id) {
+      const rows = await db(`badges?id=eq.${encodeURIComponent(body.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(payload) });
+      if (!rows?.length) return reply({ error: "Badge not found." }, 404);
+      return reply({ ok: true, badge: rows[0] });
+    }
+    const rows = await db("badges", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(payload) });
+    return reply({ ok: true, badge: rows?.[0] || null });
+  } catch (error) {
+    if (String(error.message).includes("duplicate key")) return reply({ error: "A badge with that name already exists." }, 409);
+    throw error;
+  }
+}
+
+async function deleteBadge(body) {
+  if (!body.id) return reply({ error: "Choose a badge to delete." }, 400);
+  await db(`badges?id=eq.${encodeURIComponent(body.id)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  return reply({ ok: true });
 }
 
 async function playerPinStatus(body) {
@@ -1663,16 +1721,18 @@ async function assignGuest(body) {
 
 async function adminAuditLog() {
   const rows = await db("audit_log?select=*&order=created_at.desc&limit=200");
-  const [players, events, media, scores] = await Promise.all([
+  const [players, events, media, scores, badges] = await Promise.all([
     db("players?select=id,name"),
     db("events?select=id,event_date,location,suburb"),
     db("media_items?select=id,title"),
     db("match_scores?select=id,event_id"),
+    db("badges?select=id,name").catch(() => []),
   ]);
   const playerNames = new Map((players || []).map(player => [player.id, player.name]));
   const eventNames = new Map((events || []).map(event => [event.id, `${event.event_date} · ${event.location}${event.suburb ? `, ${event.suburb}` : ""}`]));
   const mediaNames = new Map((media || []).map(item => [item.id, item.title]));
   const scoreEvents = new Map((scores || []).map(score => [score.id, eventNames.get(score.event_id) || "Saved match"]));
+  const badgeNames = new Map((badges || []).map(badge => [badge.id, badge.name]));
   const enriched = (rows || []).map(row => {
     const details = row.details || {};
     const subjectId = details.playerId || details.player_id || details.submittedBy || details.submitted_by;
@@ -1680,6 +1740,7 @@ async function adminAuditLog() {
       : row.target_type === "player" ? playerNames.get(row.target_id)
       : row.target_type === "media" ? mediaNames.get(row.target_id)
       : row.target_type === "score" ? scoreEvents.get(row.target_id)
+      : row.target_type === "badge" ? badgeNames.get(row.target_id)
       : null;
     return {
       ...row,
@@ -1715,6 +1776,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
       else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
       else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
+      else if (body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action))) beforeState = (await db(`badges?id=eq.${encodeURIComponent(body.badgeId || body.id)}&select=*`))?.[0] || null;
       else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || null;
     } catch { /* audit must never block the requested action */ }
   }
@@ -1725,6 +1787,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
       else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
       else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
+      else if (body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action))) afterState = (await db(`badges?id=eq.${encodeURIComponent(body.badgeId || body.id)}&select=*`))?.[0] || afterState;
       else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || afterState;
     } catch { /* ignore */ }
   }
@@ -1799,7 +1862,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAlertSchedules();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1825,6 +1888,8 @@ export default async (req) => {
     if (action === "admin-send-push") return runAudited(req, action, body, () => adminSendPush(body));
     if (action === "admin-save-alert-schedule") return runAudited(req, action, body, () => adminSaveAlertSchedule(body));
     if (action === "admin-delete-alert-schedule") return runAudited(req, action, body, () => adminDeleteAlertSchedule(body));
+    if (action === "admin-save-badge") return runAudited(req, action, body, () => saveBadge(body));
+    if (action === "admin-delete-badge") return runAudited(req, action, body, () => deleteBadge(body));
     if (action === "admin-duplicate-event") return runAudited(req, action, body, () => duplicateEvent(body));
   } catch (error) {
     console.error(error);
