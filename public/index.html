@@ -61,6 +61,11 @@
   .pull-refresh-indicator.ready .pull-refresh-spinner,.pull-refresh-indicator.refreshing .pull-refresh-spinner{animation:pull-refresh-spin .75s linear infinite}
   .pull-refresh-indicator.ready{background:#e8f6ee}
   @keyframes pull-refresh-spin{to{transform:rotate(360deg)}}
+  .avatar-clickable{cursor:zoom-in;outline:none}
+  .avatar-clickable:focus-visible{box-shadow:0 0 0 3px var(--lime)}
+  .avatar-viewer{text-align:center}
+  .avatar-viewer-image{display:block;width:auto;max-width:100%;max-height:62vh;object-fit:contain;margin:18px auto 0;border-radius:18px;background:#eef3ed}
+  .avatar-viewer .sub{margin-top:12px}
 </style>
 </head>
 <body>
@@ -89,7 +94,7 @@
     const $=id=>document.getElementById(id), money=n=>'$'+Number(n).toFixed(2), initials=n=>String(n||'').trim().split(/\s+/).filter(Boolean).map(x=>x[0]).slice(0,2).join('').toUpperCase(),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     function uniqueInitialMap(){const used=new Set(),map=new Map(),players=[...data.players].filter(p=>p?.id&&p.name).sort((a,b)=>a.name.localeCompare(b.name)||a.id.localeCompare(b.id));for(const p of players){const words=String(p.name).trim().split(/\s+/).filter(Boolean),first=words[0]||'P',last=words[words.length-1]||first,candidates=[initials(p.name),words.length>1?(first[0]+last[0]).toUpperCase():'',first.slice(0,2).toUpperCase(),(first[0]||'P').toUpperCase()+(last.slice(-1)||'').toUpperCase()];let value=candidates.find(candidate=>candidate&&!used.has(candidate));if(!value){let n=2;do{value=`${(first[0]||'P').toUpperCase()}${n++}`}while(used.has(value))}used.add(value);map.set(p.id,value)}return map}
     function playerInitials(p){return uniqueInitialMap().get(p?.id)||initials(p?.name||'Player')}
-    function avatarMarkup(p,className='avatar',id=''){if(!p)return`<span${id?` id="${id}"`:''} class="${className}">?</span>`;const attr=id?` id="${id}"`:'';return p.avatar_url?`<span${attr} class="${className} avatar-photo"><img src="${esc(p.avatar_url)}" alt="" loading="lazy"></span>`:`<span${attr} class="${className}">${esc(playerInitials(p))}</span>`}
+    function avatarMarkup(p,className='avatar',id=''){if(!p)return`<span${id?` id="${id}"`:''} class="${className}">?</span>`;const attr=id?` id="${id}"`:'';if(p.avatar_url)return`<span${attr} class="${className} avatar-photo avatar-clickable" data-avatar-preview="${esc(p.avatar_url)}" data-avatar-name="${esc(p.name||'Player')}" role="button" tabindex="0" title="View display picture"><img src="${esc(p.avatar_url)}" alt="${esc(p.name||'Player')} display picture" loading="lazy"></span>`;return`<span${attr} class="${className}">${esc(playerInitials(p))}</span>`}
     function bytes(n){const value=Number(n||0);if(value>=1024**3)return`${(value/1024**3).toFixed(2)} GB`;if(value>=1024**2)return`${(value/1024**2).toFixed(1)} MB`;if(value>=1024)return`${(value/1024).toFixed(1)} KB`;return`${Math.round(value)} B`}
     async function request(action,method='GET',body,admin=false){const res=await fetch(`${API}?action=${action}`,{method,headers:{'content-type':'application/json',...(playerToken?{'x-player-session':playerToken}:{}),...(adminToken&&admin?{authorization:`Bearer ${adminToken}`}:{})},body:body?JSON.stringify(body):undefined});const json=await res.json();if(!res.ok){if(res.status===401&&!admin&&!action.startsWith('player-')){playerToken=null;localStorage.removeItem('bpt-player-token');renderPlayerChooser();$('gate').classList.remove('hidden')}throw new Error(json.error||'Request failed')}return json}
     function localDate(event,timeKey){return new Date(`${event.event_date}T${event[timeKey]}`)}
@@ -506,6 +511,11 @@
         refreshing=false;reset();
       },{passive:true});
       window.addEventListener('touchcancel',()=>{active=false;reset()},{passive:true});
+    })();
+    (function setupAvatarPreview(){
+      const open=avatar=>{const url=avatar?.dataset.avatarPreview;if(!url)return;const name=avatar.dataset.avatarName||'Player';$('modalContent').innerHTML=`<div class="avatar-viewer"><p class="eyebrow">PLAYER PHOTO</p><h2>${esc(name)}</h2><img class="avatar-viewer-image" src="${esc(url)}" alt="${esc(name)} display picture"><p class="sub">Tap outside or × to close.</p></div>`;$('modal').classList.remove('hidden')};
+      document.addEventListener('click',event=>{const avatar=event.target?.closest?.('[data-avatar-preview]');if(!avatar)return;event.preventDefault();event.stopPropagation();open(avatar)},true);
+      document.addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ')&&document.activeElement?.matches?.('[data-avatar-preview]')){event.preventDefault();event.stopPropagation();open(document.activeElement)}},true);
     })();
   </script>
 </body>
