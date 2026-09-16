@@ -327,6 +327,57 @@
     const originalRenderAdminScores=renderAdminScores;
     renderAdminScores=function(){const all=data.players;data.players=all.filter(p=>!p.is_guest||p.guest_event_id===adminScoreEventId);try{return originalRenderAdminScores()}finally{data.players=all}};
     if(guestEventId&&guestInviteToken)setTimeout(showGuestInvite,300);
+
+    // Keep normal interactions responsive: state refreshes are single-flight,
+    // media is loaded only when its page is opened, and live scores use a
+    // small dedicated poll rather than reloading the entire clubhouse state.
+    let refreshInFlight=null,mediaLoaded=false,mediaLoadInFlight=null,livePollInFlight=false,eoiPollInFlight=false,eoiPending=new Set();
+    const requestWithMedia=request;
+    request=async function(action,method='GET',body,admin=false){
+      const result=await requestWithMedia(action,method,body,admin);
+      if(action==='state'&&!Object.prototype.hasOwnProperty.call(result,'media')){result.media=data.media||[];result.mediaUsage=data.mediaUsage||0}
+      if(['media-finalize','media-delete','media-favorite'].includes(action)&&result?.ok&&typeof loadMediaState==='function')setTimeout(()=>loadMediaState(true),0);
+      return result;
+    };
+    const refreshWithoutOverlap=refresh;
+    refresh=async function(){
+      if(refreshInFlight)return refreshInFlight;
+      refreshInFlight=(async()=>{try{return await refreshWithoutOverlap()}finally{refreshInFlight=null}})();
+      return refreshInFlight;
+    };
+    async function loadMediaState(force=false){
+      if(!force&&mediaLoaded)return;
+      if(mediaLoadInFlight)return mediaLoadInFlight;
+      mediaLoadInFlight=(async()=>{const result=await request('media-state');data.media=result.media||[];data.mediaUsage=result.mediaUsage||0;data.mediaLimit=result.mediaLimit||data.mediaLimit;if($('mediaPage')?.classList.contains('active')){renderMedia();enhanceMediaGallery()}mediaLoaded=true})().finally(()=>{mediaLoadInFlight=null});
+      return mediaLoadInFlight;
+    }
+    const goWithoutLazyMedia=go;
+    go=function(page){goWithoutLazyMedia(page);if(page==='media')loadMediaState(true)};
+    async function pollLiveState(){
+      if(livePollInFlight||!$('scoresPage')?.classList.contains('active')||livePointPending.size)return;
+      livePollInFlight=true;
+      try{
+        const result=await request('live-state'),incoming=result.liveMatches||[],previous=data.liveMatches||[];
+        const signature=items=>items.map(m=>`${m.id}:${m.updated_at}:${m.version}:${m.completed}`).sort().join('|');
+        if(signature(incoming)!==signature(previous)){data.liveMatches=incoming;renderScores()}
+      }catch{/* The normal refresh path will recover transient polling failures. */}
+      finally{livePollInFlight=false}
+    }
+    setInterval(pollLiveState,2000);
+    async function pollEoiState(){
+      if(eoiPollInFlight||eoiPending.size||!$('playPage')?.classList.contains('active'))return;
+      eoiPollInFlight=true;
+      try{
+        const result=await request('eoi-state'),incoming=result.eois||[],previous=data.eois||[];
+        const signature=items=>items.map(x=>`${x.event_id}:${x.player_id}:${x.status}:${x.waitlist_position}:${x.updated_at}`).sort().join('|');
+        if(signature(incoming)!==signature(previous)){data.eois=incoming;renderPlay()}
+      }catch{/* The normal refresh path will recover transient polling failures. */}
+      finally{eoiPollInFlight=false}
+    }
+    setInterval(pollEoiState,5000);
+    function upsertLocalEoi(eventId,playerId,status,waitlist_position=null){const row={event_id:eventId,player_id:playerId,status,waitlist_position,updated_at:new Date().toISOString()};const index=data.eois.findIndex(x=>x.event_id===eventId&&x.player_id===playerId);if(index>=0)data.eois[index]={...data.eois[index],...row};else data.eois.push(row)}
+    submitEoi=async function(eventId,status){const previous=data.eois.find(x=>x.event_id===eventId&&x.player_id===currentPlayerId);eoiPending.add(`${eventId}:${currentPlayerId}`);upsertLocalEoi(eventId,currentPlayerId,status);renderPlay();notify('Saving response…');try{const result=await request('eoi','POST',{eventId,playerId:currentPlayerId,status});if(result.waitlisted)upsertLocalEoi(eventId,currentPlayerId,status,1);notify(result.waitlisted?'You are on the waitlist for this week.':'Response saved');refresh().catch(()=>{})}catch(error){if(previous){upsertLocalEoi(eventId,currentPlayerId,previous.status,previous.waitlist_position)}else data.eois=data.eois.filter(x=>!(x.event_id===eventId&&x.player_id===currentPlayerId));renderPlay();notify(error.message)}finally{eoiPending.delete(`${eventId}:${currentPlayerId}`)}};
+    markPaid=async function(eventId){const info=paymentInfo(eventId),previous=data.payments.find(x=>x.event_id===eventId&&x.player_id===currentPlayerId),optimistic={event_id:eventId,player_id:currentPlayerId,amount:info?.share||0,paid:true,paid_at:new Date().toISOString()};const index=data.payments.findIndex(x=>x.event_id===eventId&&x.player_id===currentPlayerId);if(index>=0)data.payments[index]={...data.payments[index],...optimistic};else data.payments.push(optimistic);renderPayment();notify('Payment saving…');try{await request('paid','POST',{eventId,playerId:currentPlayerId});notify('Payment confirmed');refresh().catch(()=>{})}catch(error){if(previous){const i=data.payments.findIndex(x=>x.event_id===eventId&&x.player_id===currentPlayerId);if(i>=0)data.payments[i]=previous}else data.payments=data.payments.filter(x=>!(x.event_id===eventId&&x.player_id===currentPlayerId));renderPayment();notify(error.message)}};
   </script>
 </body>
 </html>

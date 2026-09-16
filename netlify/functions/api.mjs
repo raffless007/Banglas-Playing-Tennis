@@ -164,23 +164,31 @@ function upcomingWednesdays() {
   });
 }
 
+let upcomingEnsuredAt = 0;
+let upcomingEnsurePromise = null;
 async function ensureUpcomingEvents() {
-  const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
-  const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
-  if (events.length) {
-    await db("events?on_conflict=event_date", {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(events),
+  if (upcomingEnsurePromise) return upcomingEnsurePromise;
+  if (Date.now() - upcomingEnsuredAt < 60_000) return;
+  upcomingEnsurePromise = (async () => {
+    const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
+    const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
+    if (events.length) {
+      await db("events?on_conflict=event_date", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(events),
+      });
+    }
+    const now = datePartsInSydney();
+    const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
+    await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ court_fee: 54, updated_at: new Date().toISOString() }),
     });
-  }
-  const now = datePartsInSydney();
-  const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
-  await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ court_fee: 54, updated_at: new Date().toISOString() }),
-  });
+    upcomingEnsuredAt = Date.now();
+  })().finally(() => { upcomingEnsurePromise = null; });
+  return upcomingEnsurePromise;
 }
 
 function timezoneOffsetMs(date, timeZone) {
@@ -283,7 +291,7 @@ async function savePasscode(passcode) {
 
 async function appState(req) {
   await ensureUpcomingEvents();
-  const [players, events, eois, payments, scores, liveMatches, notes, mediaRows] = await Promise.all([
+  const [players, events, eois, payments, scores, liveMatches, notes] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
@@ -291,10 +299,7 @@ async function appState(req) {
     db("match_scores?select=*&order=created_at.asc"),
     db("live_matches?select=*&order=updated_at.desc"),
     db("event_notes?select=*"),
-    db("media_items?select=*&order=captured_at.desc,created_at.desc"),
   ]);
-  const media = (await Promise.all(mediaRows.map(async item => ({ ...item, public_url: await mediaUrl(item.storage_path) })))).filter(item => item.public_url);
-  const mediaUsage = media.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
   const admin = isAdmin(req);
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
   const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
@@ -302,7 +307,24 @@ async function appState(req) {
     if (admin || payment.player_id === playerId) return payment;
     return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
   });
-  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+}
+
+async function mediaState() {
+  const rows = await db("media_items?select=*&order=captured_at.desc,created_at.desc");
+  const media = (await Promise.all(rows.map(async item => ({ ...item, public_url: await mediaUrl(item.storage_path) })))).filter(item => item.public_url);
+  const mediaUsage = media.reduce((sum, item) => sum + Number(item.file_size || 0), 0);
+  return reply({ media, mediaUsage, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() });
+}
+
+async function liveState() {
+  const liveMatches = await db("live_matches?select=*&order=updated_at.desc");
+  return reply({ liveMatches, serverNow: new Date().toISOString() });
+}
+
+async function eoiState() {
+  const eois = await db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at");
+  return reply({ eois, serverNow: new Date().toISOString() });
 }
 
 async function adminState() {
@@ -1306,20 +1328,25 @@ async function duplicateEvent(body) {
 
 async function runAudited(req, action, body, operation) {
   let beforeState = null;
-  try {
-    if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
-    else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
-    else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
-    else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || null;
-  } catch { /* audit must never block the requested action */ }
+  const highFrequency = ["eoi", "paid", "score"].includes(action);
+  if (!highFrequency) {
+    try {
+      if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
+      else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
+      else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
+      else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || null;
+    } catch { /* audit must never block the requested action */ }
+  }
   const result = await operation();
   let afterState = body?.changes || null;
-  try {
-    if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
-    else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
-    else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
-    else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || afterState;
-  } catch { /* ignore */ }
+  if (!highFrequency) {
+    try {
+      if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
+      else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
+      else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
+      else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email`))?.[0] || afterState;
+    } catch { /* ignore */ }
+  }
   await writeAudit(req, action, body, result.status >= 400 ? "failed" : "success", beforeState, afterState);
   return result;
 }
@@ -1332,6 +1359,9 @@ export default async (req) => {
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
     if (req.method === "GET" && action === "state") return reply(await appState(req));
+    if (req.method === "GET" && action === "media-state") return mediaState();
+    if (req.method === "GET" && action === "live-state") return liveState();
+    if (req.method === "GET" && action === "eoi-state") return eoiState();
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
