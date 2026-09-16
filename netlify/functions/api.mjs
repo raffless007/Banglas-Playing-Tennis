@@ -1091,6 +1091,49 @@ async function adminAlertLog() {
   return reply({ rows });
 }
 
+async function adminAlertSchedules() {
+  const rows = await db("push_alert_schedules?select=*&order=sort_order.asc,name.asc");
+  return reply({ rows });
+}
+
+function alertScheduleFields(body, code) {
+  const name = String(body.name || "").trim().slice(0, 120);
+  const notificationType = ["payments", "eoi", "session", "matches"].includes(body.notificationType) ? body.notificationType : "payments";
+  const delayMinutes = Number(body.delayMinutes);
+  const repeatValue = body.repeatIntervalMinutes === "" || body.repeatIntervalMinutes == null ? null : Number(body.repeatIntervalMinutes);
+  const titleTemplate = String(body.titleTemplate || "Tennis payment reminder").trim().slice(0, 120);
+  const bodyTemplate = String(body.bodyTemplate || "{date}: ${amount} is still outstanding. Payment PayID: {payid}.").trim().slice(0, 500);
+  const sortOrder = Number.isFinite(Number(body.sortOrder)) ? Math.max(0, Math.min(9999, Number(body.sortOrder))) : 100;
+  if (name.length < 2) return { error: "Give this scheduled alert a name." };
+  if (!Number.isFinite(delayMinutes) || delayMinutes < 0 || delayMinutes > 525600) return { error: "Delay must be between 0 minutes and 1 year." };
+  if (repeatValue !== null && (!Number.isFinite(repeatValue) || repeatValue <= 0 || repeatValue > 525600)) return { error: "Repeat interval must be blank or between 1 minute and 1 year." };
+  if (!titleTemplate || !bodyTemplate) return { error: "Add a notification title and message." };
+  return { code, name, notification_type: notificationType, delay_minutes: Math.round(delayMinutes), repeat_interval_minutes: repeatValue === null ? null : Math.round(repeatValue), title_template: titleTemplate, body_template: bodyTemplate, enabled: body.enabled !== false, sort_order: Math.round(sortOrder), updated_at: new Date().toISOString() };
+}
+
+async function adminSaveAlertSchedule(body) {
+  const id = String(body.id || "").trim();
+  if (id && !/^[0-9a-f-]{36}$/i.test(id)) return reply({ error: "Choose a valid scheduled alert." }, 400);
+  let code = String(body.code || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  if (!code) code = `custom-${randomUUID()}`;
+  const fields = alertScheduleFields(body, code);
+  if (fields.error) return reply({ error: fields.error }, 400);
+  if (id) {
+    const updated = await db(`push_alert_schedules?id=eq.${encodeURIComponent(id)}&select=*`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(fields) });
+    if (!updated?.length) return reply({ error: "Scheduled alert was not found." }, 404);
+    return reply({ ok: true, row: updated[0] });
+  }
+  const inserted = await db("push_alert_schedules", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(fields) });
+  return reply({ ok: true, row: inserted?.[0] || null });
+}
+
+async function adminDeleteAlertSchedule(body) {
+  const id = String(body.id || "").trim();
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return reply({ error: "Choose a valid scheduled alert." }, 400);
+  await db(`push_alert_schedules?id=eq.${encodeURIComponent(id)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  return reply({ ok: true });
+}
+
 async function addPlayer(body) {
   const name = String(body.name || "").trim();
   if (name.length < 2 || name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use letters, numbers, spaces, apostrophes or hyphens only for player names." }, 400);
@@ -1750,7 +1793,11 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAlertLog();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
+    if (req.method === "GET" && action === "admin-alert-schedules") {
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
+      return adminAlertSchedules();
+    }
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1774,6 +1821,8 @@ export default async (req) => {
     if (action === "admin-delete-score") return runAudited(req, action, body, () => adminDeleteScore(body));
     if (action === "admin-delete-media") return runAudited(req, action, body, () => adminDeleteMedia(body));
     if (action === "admin-send-push") return runAudited(req, action, body, () => adminSendPush(body));
+    if (action === "admin-save-alert-schedule") return runAudited(req, action, body, () => adminSaveAlertSchedule(body));
+    if (action === "admin-delete-alert-schedule") return runAudited(req, action, body, () => adminDeleteAlertSchedule(body));
     if (action === "admin-duplicate-event") return runAudited(req, action, body, () => duplicateEvent(body));
   } catch (error) {
     console.error(error);

@@ -31,6 +31,33 @@ function paymentShare(event, attendingCount) {
   return Number(((Number(event.court_fee) + (event.court_2_enabled ? Number(event.court_2_fee || 0) : 0)) / attendingCount + Number(event.ball_fee || 0)).toFixed(2));
 }
 
+const DEFAULT_PAYMENT_SCHEDULES = [
+  { code: "payment-30m", name: "30 minutes after session completion", notification_type: "payments", delay_minutes: 30, repeat_interval_minutes: null, title_template: "Payment is now open", body_template: "{date}: ${amount} is due. Payment PayID: {payid}.", enabled: true, sort_order: 10 },
+  { code: "payment-12h", name: "12 hours after session completion", notification_type: "payments", delay_minutes: 720, repeat_interval_minutes: null, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 20 },
+  { code: "payment-36h", name: "36 hours after session completion", notification_type: "payments", delay_minutes: 2160, repeat_interval_minutes: null, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 30 },
+  { code: "payment-daily", name: "Every 24 hours until paid", notification_type: "payments", delay_minutes: 3600, repeat_interval_minutes: 1440, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 40 },
+];
+
+async function paymentSchedules() {
+  try {
+    const rows = await db("push_alert_schedules?notification_type=eq.payments&select=*&order=sort_order.asc,name.asc");
+    return rows?.length ? rows : DEFAULT_PAYMENT_SCHEDULES;
+  } catch (error) {
+    console.error("Alert schedule lookup failed; using defaults", error);
+    return DEFAULT_PAYMENT_SCHEDULES;
+  }
+}
+
+function scheduleText(template, values) {
+  return String(template || "")
+    .replaceAll("{player}", values.player)
+    .replaceAll("{date}", values.date)
+    .replaceAll("${amount}", values.amount)
+    .replaceAll("{amount}", values.amount)
+    .replaceAll("{payid}", "0420451170")
+    .replaceAll("{location}", values.location);
+}
+
 async function matchRainChance(event) {
   const startsAt = localDateTimeToUtc(event.event_date, startTime(event), event.timezone || SYDNEY).getTime();
   const daysAhead = Math.ceil((startsAt - Date.now()) / (24 * 60 * 60 * 1000));
@@ -63,11 +90,12 @@ async function matchRainChance(event) {
 
 export default async () => {
   if (!pushConfigured()) return new Response("Push notifications are not configured.", { status: 200 });
-  const [events, eois, payments, allPlayers] = await Promise.all([
+  const [events, eois, payments, allPlayers, schedules] = await Promise.all([
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,waitlist_position"),
     db("payments?select=event_id,player_id,paid"),
     activePlayerIds(),
+    paymentSchedules(),
   ]);
   const now = Date.now();
   for (const event of events) {
@@ -87,13 +115,17 @@ export default async () => {
     if (now >= deadline - 60 * 60 * 1000 && now < deadline) {
       await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-1h:${event.id}`, eventId: event.id, title: "EOI closing soon", body: `${label}: there is one hour left to confirm your spot.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
     }
-    if (attending.length && now >= endsAt && now < endsAt + 7 * 24 * 60 * 60 * 1000) {
+    if (attending.length && unpaid.length && now >= endsAt && !event.account_closed) {
       const amount = paymentShare(event, attending.length).toFixed(2);
-      await notifyPlayers({ playerIds: unpaid, notificationType: "payments", notificationKey: `payment-open:${event.id}`, eventId: event.id, title: "Payment is now open", body: `${label}: $${amount} is due. PayID 0420451170.`, url: `/?page=payments&event=${encodeURIComponent(event.id)}` });
-    }
-    if (attending.length && now >= endsAt + 48 * 60 * 60 * 1000 && now < endsAt + 10 * 24 * 60 * 60 * 1000) {
-      const amount = paymentShare(event, attending.length).toFixed(2);
-      await notifyPlayers({ playerIds: unpaid, notificationType: "payments", notificationKey: `payment-48h:${event.id}`, eventId: event.id, title: "Payment reminder", body: `${label}: $${amount} is still outstanding. PayID 0420451170.`, url: `/?page=payments&event=${encodeURIComponent(event.id)}` });
+      const values = { date: label, amount: `$${amount}`, location: `${event.location}, ${event.suburb}` };
+      for (const schedule of schedules.filter(row => row.enabled && row.notification_type === "payments")) {
+        const delayMs = Math.max(0, Number(schedule.delay_minutes || 0)) * 60 * 1000;
+        const repeatMs = Number(schedule.repeat_interval_minutes || 0) * 60 * 1000;
+        if (now - endsAt < delayMs) continue;
+        const occurrence = repeatMs > 0 ? Math.floor((now - endsAt - delayMs) / repeatMs) : 0;
+        const notificationKey = `payment-schedule:${schedule.code}:${event.id}:${occurrence}`;
+        await notifyPlayers({ playerIds: unpaid, notificationType: "payments", notificationKey, eventId: event.id, title: scheduleText(schedule.title_template, values), body: scheduleText(schedule.body_template, values), url: `/?page=payments&event=${encodeURIComponent(event.id)}`, audience: "attending" });
+      }
     }
     if (attending.length && now < startsAt && event.cancellation_status !== "cancelled") {
       try {
