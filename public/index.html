@@ -444,6 +444,7 @@
     const requestWithMedia=request;
     request=async function(action,method='GET',body,admin=false){
       const result=await requestWithMedia(action,method,body,admin);
+      if(action==='state'&&Object.prototype.hasOwnProperty.call(result,'sessionPlayerId')){if(playerToken&&!result.sessionPlayerId){currentPlayerId=null;playerToken=null;localStorage.removeItem('bpt-player-id');localStorage.removeItem('bpt-player-token')}else if(result.sessionPlayerId&&result.sessionPlayerId!==currentPlayerId){currentPlayerId=result.sessionPlayerId;localStorage.setItem('bpt-player-id',result.sessionPlayerId)}}
       if(action==='state'&&!Object.prototype.hasOwnProperty.call(result,'media')){result.media=data.media||[];result.mediaUsage=data.mediaUsage||0}
       if(['media-finalize','media-delete','media-favorite'].includes(action)&&result?.ok&&typeof loadMediaState==='function')setTimeout(()=>loadMediaState(true),0);
       return result;

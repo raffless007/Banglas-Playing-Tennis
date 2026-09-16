@@ -382,12 +382,13 @@ async function appState(req) {
     await createPlayerNotifications(pending).catch(() => {});
   }
   const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
-  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, sessionPlayerId: playerId, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function mediaState(req) {
   const rows = await db("media_items?select=*&order=captured_at.desc,created_at.desc");
-  const playerId = isAdmin(req) ? null : playerSessionSubject(req);
+  const candidatePlayerId = isAdmin(req) ? null : playerSessionSubject(req);
+  const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
   const favouriteRows = playerId
     ? await db(`media_favourites?player_id=eq.${encodeURIComponent(playerId)}&select=media_id`).catch(() => [])
     : [];
