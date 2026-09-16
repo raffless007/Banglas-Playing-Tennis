@@ -64,6 +64,8 @@
   .avatar-clickable{cursor:zoom-in;outline:none}
   .avatar-clickable:focus-visible{box-shadow:0 0 0 3px var(--lime)}
   .avatar-viewer{text-align:center}
+  /* Tone down harsh phone-camera highlights on screen without changing the stored original. */
+  .avatar-photo img,.avatar-viewer-image{filter:brightness(.92) contrast(.84) saturate(.96)}
   .avatar-viewer-image{display:block;width:auto;max-width:100%;max-height:62vh;object-fit:contain;margin:18px auto 0;border-radius:18px;background:#eef3ed}
   .avatar-viewer .sub{margin-top:12px}
 </style>
