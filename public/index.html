@@ -54,9 +54,21 @@
     z-index: 4;
   }
 </style>
+<style>
+  .pull-refresh-indicator{position:fixed;top:84px;left:50%;z-index:40;display:flex;align-items:center;gap:8px;padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:#fffffff2;color:var(--green);box-shadow:0 10px 30px #173a3120;font-size:10px;font-weight:850;opacity:0;pointer-events:none;transform:translate(-50%,-80px);transition:opacity .18s ease,transform .18s ease}
+  .pull-refresh-indicator.visible{opacity:1;transform:translate(-50%,0)}
+  .pull-refresh-spinner{width:16px;height:16px;border:2px solid #dce4df;border-top-color:var(--green);border-radius:50%;display:inline-block}
+  .pull-refresh-indicator.ready .pull-refresh-spinner,.pull-refresh-indicator.refreshing .pull-refresh-spinner{animation:pull-refresh-spin .75s linear infinite}
+  .pull-refresh-indicator.ready{background:#e8f6ee}
+  @keyframes pull-refresh-spin{to{transform:rotate(360deg)}}
+</style>
 </head>
 <body>
   <div id="loading" class="loading">Loading the clubhouse…</div>
+  <div id="pullRefreshIndicator" class="pull-refresh-indicator" aria-live="polite" aria-hidden="true">
+    <span class="pull-refresh-spinner" aria-hidden="true"></span>
+    <span data-pull-label>Pull to refresh</span>
+  </div>
   <header class="top"><div class="brand"><div class="logo">BP</div><div><strong>Banglas Playing Tennis</strong><small>WEDNESDAY SOCIALS</small></div></div><nav class="nav"><button class="active" data-page="play">Play</button><button data-page="scores">Scores</button><button data-page="profiles">Profiles</button><button data-page="media">Media</button><button data-page="payments">Payments <b id="badge">🔒</b></button><button data-page="admin">Admin</button></nav><div class="account-actions"><button id="notifications" class="notifbtn" title="Notification settings" aria-label="Notification settings">🔔</button><button id="profile" class="profile"><span id="profileAvatar" class="avatar">?</span><strong id="profileName">Player</strong></button></div></header>
   <main>
     <section id="playPage" class="page active"><div class="hero"><div><p class="eyebrow">WEDNESDAY NIGHT TENNIS</p><h1>Ready to play?</h1><p class="sub">Choose a week and lock in your spot.</p></div><span class="live">● LIVE SHARED EOIs</span></div><div id="weeks" class="weeks"></div><div class="grid"><article class="card event"><div class="row"><span id="eventStatus" class="pill"></span><span id="deadline" class="deadline"></span></div><div class="eventtitle"><h2 id="eventDate"></h2><p>Weekly social · Mixed doubles</p></div><div class="details"><div class="detail"><span class="ico">◷</span><div><small>PRIMARY COURT</small><strong id="eventCourt1Name"></strong><em id="eventTime"></em></div></div><div class="detail"><span class="ico">⌖</span><div><small>LOCATION</small><strong id="eventLocation"></strong><em id="eventSuburb"></em></div></div></div><div id="court2Details" class="court-two hidden"></div><div id="weatherCard" class="weather-card"></div><div class="response"><div class="row"><div style="display:flex;align-items:center;gap:9px"><span id="responseAvatar" class="avatar">?</span><strong>Your response</strong></div><small id="responseHint"></small></div><div class="choices"><button class="choice yes" data-response="yes"><b>✓</b><div><strong>I’m in</strong><small>Count me in</small></div></button><button class="choice no" data-response="no"><b>×</b><div><strong>Can’t make it</strong><small>Not this week</small></div></button></div></div></article><aside class="side"><article class="card players"><div class="cardhead"><div><h3>Who’s playing</h3><p>Live responses</p></div><span id="yesCount" class="count"></span></div><div id="faces" class="faces"></div><div class="stats"><div><strong id="yesStat"></strong><span>IN</span></div><div><strong id="pendingStat"></strong><span>NO REPLY</span></div><div><strong id="noStat"></strong><span>OUT</span></div></div><button id="viewList" class="textbtn">View full player list <span>→</span></button><div class="share-row"><button id="copyEoiSummary" class="secondary">Copy EOI summary</button><button id="whatsEoiSummary" class="secondary">WhatsApp</button></div></article><article id="pendingCard" class="card players"></article><article id="lastPaymentSummary" class="card players hidden"></article><article id="lockedSummary" class="card locked-summary hidden"></article><div class="note"><strong>EOI closes 6 hours before first serve.</strong></div></aside></div></section>
@@ -466,6 +478,35 @@
     function wireScheduleForm(form,row){if(!form)return;form.querySelector('[data-save-schedule]').onclick=()=>saveAlertScheduleForm(form,row);form.querySelector('[data-cancel-schedule]').onclick=()=>{if(row){form.closest('details').open=false}else{$('newScheduleForm').classList.add('hidden')}};form.querySelector('[data-delete-schedule]')?.addEventListener('click',async()=>{if(!confirm(`Delete “${row.name}”?`))return;try{await request('admin-delete-alert-schedule','POST',{id:row.id},true);notify('Scheduled alert deleted');await renderAdminScheduledAlerts()}catch(error){notify(error.message)}})}
     function enhanceAdminAlerts(){const dashboard=$('dashboard'),tabs=dashboard?.querySelector('.tabs');if(!dashboard||!tabs||!adminToken)return;let alertsButton=tabs.querySelector('[data-tab="alerts"]'),alertsPanel=$('alertsPanel'),created=!alertsButton||!alertsPanel;if(!alertsButton){alertsButton=document.createElement('button');alertsButton.dataset.tab='alerts';alertsButton.textContent='Alerts';tabs.appendChild(alertsButton)}tabs.querySelectorAll('[data-tab="push"],[data-tab="alert"]').forEach(button=>button.classList.add('hidden'));if(!alertsPanel){alertsPanel=document.createElement('div');alertsPanel.id='alertsPanel';alertsPanel.className='panel';dashboard.appendChild(alertsPanel);const subnav=document.createElement('div');subnav.className='alert-subtabs';subnav.innerHTML='<button type="button" data-alert-subtab="push" class="active">Push Alerts</button><button type="button" data-alert-subtab="scheduled">Scheduled Alerts</button><button type="button" data-alert-subtab="alert">Alert Log</button>';const scheduled=document.createElement('div');scheduled.id='scheduledAlertsPanel';scheduled.className='alert-subpanel';alertsPanel.append(subnav,scheduled)}const push=$('pushPanel'),log=$('alertPanel');if(push&&push.parentElement!==alertsPanel){push.classList.add('alert-subpanel');alertsPanel.appendChild(push)}if(log&&log.parentElement!==alertsPanel){log.classList.add('alert-subpanel');alertsPanel.appendChild(log)}const subnav=alertsPanel.querySelector('.alert-subtabs');const subPanels={push:$('pushPanel'),scheduled:$('scheduledAlertsPanel'),alert:$('alertPanel')};subnav?.querySelectorAll('[data-alert-subtab]').forEach(button=>button.onclick=()=>{subnav.querySelectorAll('[data-alert-subtab]').forEach(item=>item.classList.toggle('active',item===button));Object.entries(subPanels).forEach(([key,panel])=>panel?.classList.toggle('active',key===button.dataset.alertSubtab));if(button.dataset.alertSubtab==='scheduled'&&!$('scheduledAlertsPanel').dataset.loaded){$('scheduledAlertsPanel').dataset.loaded='true';renderAdminScheduledAlerts()}});if(created){alertsButton.onclick=()=>{tabs.querySelectorAll('button').forEach(button=>button.classList.toggle('active',button===alertsButton));dashboard.querySelectorAll(':scope > .panel').forEach(panel=>panel.classList.toggle('active',panel===alertsPanel));subnav?.querySelector('[data-alert-subtab="push"]')?.click()}}if(!alertsPanel.classList.contains('active')){} }
     const baseRenderAdmin=renderAdmin;renderAdmin=function(){baseRenderAdmin();enhanceAdminAlerts()};
+    (function setupPullToRefresh(){
+      const indicator=$('pullRefreshIndicator');
+      if(!indicator)return;
+      const label=indicator.querySelector('[data-pull-label]');
+      const threshold=96,maxPull=150;
+      let active=false,startY=0,distance=0,refreshing=false;
+      const blockedTarget=target=>target?.closest?.('input,textarea,select,button,a,[contenteditable="true"],.modal,.gate,.leaderboard');
+      const reset=()=>{distance=0;indicator.classList.remove('visible','ready','refreshing');indicator.setAttribute('aria-hidden','true');if(label)label.textContent='Pull to refresh'};
+      window.addEventListener('touchstart',event=>{
+        if(refreshing||event.touches.length!==1||window.scrollY>0||blockedTarget(event.target))return;
+        active=true;startY=event.touches[0].clientY;distance=0;
+      },{passive:true});
+      window.addEventListener('touchmove',event=>{
+        if(!active||refreshing||event.touches.length!==1)return;
+        if(window.scrollY>0){active=false;reset();return}
+        const next=event.touches[0].clientY-startY;
+        if(next<=0){active=false;reset();return}
+        distance=Math.min(next,maxPull);indicator.classList.add('visible');indicator.classList.toggle('ready',distance>=threshold);indicator.setAttribute('aria-hidden','false');if(label)label.textContent=distance>=threshold?'Release to refresh':'Pull to refresh';
+      },{passive:true});
+      window.addEventListener('touchend',async()=>{
+        if(!active)return;
+        active=false;
+        if(distance<threshold){reset();return}
+        refreshing=true;indicator.classList.add('visible','ready','refreshing');if(label)label.textContent='Refreshing…';
+        try{await refresh()}catch{/* the normal toast/error path handles refresh failures */}
+        refreshing=false;reset();
+      },{passive:true});
+      window.addEventListener('touchcancel',()=>{active=false;reset()},{passive:true});
+    })();
   </script>
 </body>
 </html>
