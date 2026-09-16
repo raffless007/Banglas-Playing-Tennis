@@ -332,8 +332,15 @@ async function adminState() {
     db("players?select=id,name,active,email,is_guest,guest_event_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=player_id&active=eq.true"),
   ]);
+  let guestHistory = [];
+  try {
+    guestHistory = await db("guest_history?select=*&order=assigned_at.desc");
+  } catch {
+    // The archive migration may still be waiting to be applied. Keep the
+    // existing roster controls usable until it is run.
+  }
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
-  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })) };
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })), guestHistory };
 }
 
 async function playerPinStatus(body) {
@@ -947,7 +954,7 @@ function validGuestName(name) {
 }
 
 async function createGuestParticipant({ eventId, name, email = null, status = "yes" }) {
-  const existingRows = await db(`players?name=eq.${encodeURIComponent(name)}&select=id,name,active,is_guest,guest_event_id`);
+  const existingRows = await db(`players?name=eq.${encodeURIComponent(name)}&select=id,name,email,active,is_guest,guest_event_id`);
   let player = existingRows?.[0] || null;
   if (player) {
     if (!player.is_guest || player.guest_event_id !== eventId) {
@@ -973,7 +980,27 @@ async function createGuestParticipant({ eventId, name, email = null, status = "y
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_id: eventId, player_id: player.id, status: status === "no" ? "no" : "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
   });
+  await recordGuestHistory(player, eventId);
   return { player };
+}
+
+async function recordGuestHistory(player, eventId) {
+  try {
+    await db("guest_history?on_conflict=event_id,guest_player_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        guest_player_id: player.id,
+        event_id: eventId,
+        guest_name: player.name,
+        guest_email: player.email || null,
+        assigned_at: new Date().toISOString(),
+      }),
+    });
+  } catch {
+    // Keep guest RSVP usable while an older deployment is waiting for the
+    // guest archive migration. The migration backfill captures existing rows.
+  }
 }
 
 async function addGuest(body) {
@@ -1285,11 +1312,18 @@ async function updatePlayer(body) {
   return reply({ ok: true });
 }
 
+async function updateGuest(body) {
+  if (!body.playerId) return reply({ error: "Choose a guest." }, 400);
+  const guestRows = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,is_guest`);
+  if (!guestRows?.length) return reply({ error: "That player is not in the guest archive." }, 404);
+  return updatePlayer(body);
+}
+
 async function assignGuest(body) {
   if (!body.playerId || !body.eventId) return reply({ error: "Choose a guest and a week." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
-  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,active,is_guest,guest_event_id`);
+  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,email,active,is_guest,guest_event_id`);
   const guest = guests?.[0];
   if (!guest) return reply({ error: "Choose a guest from the archive." }, 404);
   await db(`players?id=eq.${encodeURIComponent(guest.id)}`, {
@@ -1300,6 +1334,7 @@ async function assignGuest(body) {
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_id: event.id, player_id: guest.id, status: "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
   });
+  await recordGuestHistory(guest, event.id);
   return reply({ ok: true, playerId: guest.id, eventId: event.id });
 }
 
@@ -1429,7 +1464,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAuditLog();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1440,6 +1475,7 @@ export default async (req) => {
     if (action === "admin-add-guest") return runAudited(req, action, body, () => addGuest(body));
     if (action === "admin-create-guest-invite") return runAudited(req, action, body, () => createGuestInvite(body));
     if (action === "admin-update-player") return runAudited(req, action, body, () => updatePlayer(body));
+    if (action === "admin-update-guest") return runAudited(req, action, body, () => updateGuest(body));
     if (action === "admin-assign-guest") return runAudited(req, action, body, () => assignGuest(body));
     if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
     if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));

@@ -49,6 +49,23 @@ alter table public.players
 alter table public.events
   add column if not exists guest_invite_token text unique;
 
+-- Durable guest archive. Guest participation is kept as a snapshot so a guest
+-- can be reused for another week without losing their previous history.
+create table if not exists public.guest_history (
+  id uuid primary key default gen_random_uuid(),
+  guest_player_id uuid references public.players(id) on delete set null,
+  event_id uuid not null references public.events(id) on delete cascade,
+  guest_name text not null,
+  guest_email text,
+  assigned_at timestamptz not null default now(),
+  unique (event_id, guest_player_id)
+);
+
+create index if not exists guest_history_player_idx
+  on public.guest_history (guest_player_id, assigned_at desc);
+create index if not exists guest_history_event_idx
+  on public.guest_history (event_id, assigned_at desc);
+
 create table if not exists public.deleted_event_dates (
   event_date date primary key,
   deleted_at timestamptz not null default now()
@@ -226,6 +243,7 @@ alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
 alter table public.push_subscriptions enable row level security;
 alter table public.push_notification_log enable row level security;
+alter table public.guest_history enable row level security;
 
 create or replace function public.record_player_pin_failure(target_player_id uuid)
 returns table(failed_attempts integer, pin_locked_at timestamptz)
