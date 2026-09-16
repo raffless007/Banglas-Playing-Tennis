@@ -245,6 +245,7 @@ create table if not exists public.push_alerts (
   body text not null,
   url text,
   recipient_count integer not null default 0,
+  recipient_ids jsonb not null default '[]'::jsonb,
   device_count integer not null default 0,
   sent_count integer not null default 0,
   failed_count integer not null default 0,

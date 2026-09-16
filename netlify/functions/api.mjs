@@ -951,12 +951,38 @@ async function adminSendPush(body) {
 }
 
 async function adminAlertLog() {
-  const [alerts, events] = await Promise.all([
+  const [alerts, logs, subscriptions, players, events] = await Promise.all([
     db("push_alerts?select=*&order=created_at.desc&limit=300"),
+    db("push_notification_log?select=*&order=sent_at.asc&limit=2000"),
+    db("push_subscriptions?select=id,player_id"),
+    db("players?select=id,name,is_guest"),
     db("events?select=id,event_date,location,suburb"),
   ]);
   const eventById = new Map((events || []).map(event => [event.id, event]));
-  return reply({ rows: (alerts || []).map(alert => ({ ...alert, event: alert.event_id ? eventById.get(alert.event_id) || null : null })) });
+  const playerById = new Map((players || []).map(player => [player.id, player]));
+  const subscriptionPlayerById = new Map((subscriptions || []).map(subscription => [subscription.id, subscription.player_id]));
+  const logsByKey = new Map();
+  for (const log of logs || []) {
+    const keyLogs = logsByKey.get(log.notification_key) || [];
+    keyLogs.push(log);
+    logsByKey.set(log.notification_key, keyLogs);
+  }
+  const rows = (alerts || []).map(alert => {
+    const alertLogs = logsByKey.get(alert.notification_key) || [];
+    const fallbackIds = [...new Set(alertLogs.map(log => log.player_id || subscriptionPlayerById.get(log.subscription_id)).filter(Boolean))];
+    const recipientIds = Array.isArray(alert.recipient_ids) && alert.recipient_ids.length ? alert.recipient_ids.filter(Boolean) : fallbackIds;
+    const deliveries = recipientIds.map(playerId => {
+      const player = playerById.get(playerId);
+      const playerLogs = alertLogs.filter(log => (log.player_id || subscriptionPlayerById.get(log.subscription_id)) === playerId);
+      const statuses = playerLogs.map(log => log.status);
+      const status = statuses.includes("sent") ? (statuses.includes("failed") ? "partial" : "sent") : statuses.includes("failed") ? "failed" : playerLogs.length ? "pending" : "not_sent";
+      const failure = playerLogs.find(log => log.error_message);
+      const delivered = playerLogs.find(log => log.status === "sent" && (log.delivered_at || log.sent_at));
+      return { player_id: playerId, player_name: player?.name || "Unknown player", is_guest: Boolean(player?.is_guest), status, error_message: failure?.error_message || null, delivered_at: delivered?.delivered_at || null };
+    });
+    return { ...alert, event: alert.event_id ? eventById.get(alert.event_id) || null : null, deliveries };
+  });
+  return reply({ rows });
 }
 
 async function addPlayer(body) {

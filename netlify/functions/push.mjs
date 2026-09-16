@@ -38,8 +38,8 @@ function subscriptionQuery(playerIds, notificationType) {
   return `push_subscriptions?player_id=in.(${quoted})&active=eq.true&preferences-%3E%3E${notificationType}=eq.true&select=id,player_id,endpoint,p256dh,auth`;
 }
 
-async function createAlert({ notificationKey, notificationType, audience, eventId, title, body, url, recipientCount }) {
-  const rows = await db("push_alerts?on_conflict=notification_key", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=representation" }, body: JSON.stringify({ notification_key: notificationKey, notification_type: notificationType, audience: audience || null, event_id: eventId || null, title, body, url, recipient_count: recipientCount }) });
+async function createAlert({ notificationKey, notificationType, audience, eventId, title, body, url, recipientCount, recipientIds }) {
+  const rows = await db("push_alerts?on_conflict=notification_key", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=representation" }, body: JSON.stringify({ notification_key: notificationKey, notification_type: notificationType, audience: audience || null, event_id: eventId || null, title, body, url, recipient_count: recipientCount, recipient_ids: recipientIds || [] }) });
   return rows?.[0] || null;
 }
 
@@ -78,8 +78,9 @@ async function disableSubscription(subscriptionId) {
  * remain safe to retry.
  */
 export async function notifyPlayers({ playerIds, notificationType, notificationKey, title, body, url = "/", eventId = null, audience = null }) {
-  const recipientCount = asPlayerIds(playerIds).length;
-  const alert = await createAlert({ notificationKey, notificationType, audience, eventId, title, body, url, recipientCount });
+  const recipientIds = asPlayerIds(playerIds);
+  const recipientCount = recipientIds.length;
+  const alert = await createAlert({ notificationKey, notificationType, audience, eventId, title, body, url, recipientCount, recipientIds });
   if (!alert) return { skipped: true, sent: 0, duplicate: true };
   if (!pushConfigured() || !PUSH_TYPES.has(notificationType)) {
     await updateAlert(notificationKey, { status: "skipped", completed_at: new Date().toISOString() });
