@@ -926,16 +926,27 @@ async function deleteEvent(body) {
 }
 
 async function adminSendPush(body) {
-  const event = await getEvent(body.eventId);
-  if (!event) return reply({ error: "Choose a valid event." }, 404);
+  const event = body.eventId ? await getEvent(body.eventId) : null;
+  if (body.eventId && !event) return reply({ error: "Choose a valid event." }, 404);
   const title = String(body.title || "Match update").trim().slice(0, 80);
   const message = String(body.message || "").trim().slice(0, 240);
   if (!message) return reply({ error: "Write the update first." }, 400);
-  const audience = body.audience === "all" ? "all" : "attending";
-  const playerIds = audience === "all"
-    ? await activePlayerIds()
-    : (await db(`eois?event_id=eq.${encodeURIComponent(event.id)}&status=eq.yes&select=player_id`)).map(row => row.player_id);
-  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-update:${event.id}:${Date.now()}`, eventId: event.id, title, body: message, url: `/?page=scores&event=${encodeURIComponent(event.id)}` });
+  const audience = ["all", "attending", "selected"].includes(body.audience) ? body.audience : "all";
+  let playerIds;
+  if (audience === "attending") {
+    if (!event) return reply({ error: "Choose a week when sending to players marked In." }, 400);
+    playerIds = (await db(`eois?event_id=eq.${encodeURIComponent(event.id)}&status=eq.yes&select=player_id`)).map(row => row.player_id);
+  } else if (audience === "selected") {
+    const requested = Array.isArray(body.playerIds) ? body.playerIds : [];
+    const ids = [...new Set(requested.map(id => String(id).trim()).filter(id => /^[0-9a-f-]{36}$/i.test(id)))];
+    if (!ids.length) return reply({ error: "Choose at least one player." }, 400);
+    const quoted = ids.map(id => `"${id}"`).join(",");
+    playerIds = (await db(`players?id=in.(${quoted})&active=eq.true&select=id`)).map(row => row.id);
+  } else {
+    playerIds = await activePlayerIds();
+  }
+  const targetUrl = event ? `/?page=scores&event=${encodeURIComponent(event.id)}` : "/?page=play";
+  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-manual:${Date.now()}`, eventId: event?.id || null, title, body: message, url: targetUrl });
   return reply({ ok: true, sent: result.sent || 0 });
 }
 
