@@ -946,8 +946,17 @@ async function adminSendPush(body) {
     playerIds = await activePlayerIds();
   }
   const targetUrl = event ? `/?page=scores&event=${encodeURIComponent(event.id)}` : "/?page=play";
-  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-manual:${Date.now()}`, eventId: event?.id || null, title, body: message, url: targetUrl });
+  const result = await notifyPlayers({ playerIds, notificationType: "matches", notificationKey: `admin-manual:${Date.now()}`, eventId: event?.id || null, title, body: message, url: targetUrl, audience });
   return reply({ ok: true, sent: result.sent || 0 });
+}
+
+async function adminAlertLog() {
+  const [alerts, events] = await Promise.all([
+    db("push_alerts?select=*&order=created_at.desc&limit=300"),
+    db("events?select=id,event_date,location,suburb"),
+  ]);
+  const eventById = new Map((events || []).map(event => [event.id, event]));
+  return reply({ rows: (alerts || []).map(alert => ({ ...alert, event: alert.event_id ? eventById.get(alert.event_id) || null : null })) });
 }
 
 async function addPlayer(body) {
@@ -1515,6 +1524,10 @@ export default async (req) => {
     if (req.method === "GET" && action === "admin-audit-log") {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAuditLog();
+    }
+    if (req.method === "GET" && action === "admin-alert-log") {
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
+      return adminAlertLog();
     }
     if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);

@@ -225,7 +225,32 @@ create table if not exists public.push_notification_log (
   notification_type text not null,
   event_id uuid,
   sent_at timestamptz not null default now(),
+  player_id uuid references public.players(id) on delete set null,
+  title text,
+  body text,
+  url text,
+  status text not null default 'pending' check (status in ('pending','sent','failed')),
+  error_message text,
+  delivered_at timestamptz,
   unique (subscription_id, notification_key)
+);
+
+create table if not exists public.push_alerts (
+  id uuid primary key default gen_random_uuid(),
+  notification_key text not null unique,
+  notification_type text not null,
+  audience text,
+  event_id uuid references public.events(id) on delete set null,
+  title text not null,
+  body text not null,
+  url text,
+  recipient_count integer not null default 0,
+  device_count integer not null default 0,
+  sent_count integer not null default 0,
+  failed_count integer not null default 0,
+  status text not null default 'pending' check (status in ('pending','sent','partial','failed','no_recipients','skipped')),
+  created_at timestamptz not null default now(),
+  completed_at timestamptz
 );
 
 -- The browser never connects directly to these tables. Only Netlify Functions
@@ -246,6 +271,8 @@ alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
 alter table public.push_subscriptions enable row level security;
 alter table public.push_notification_log enable row level security;
+alter table public.push_alerts enable row level security;
+revoke all on table public.push_alerts from anon, authenticated;
 alter table public.guest_history enable row level security;
 
 create or replace function public.record_player_pin_failure(target_player_id uuid)
@@ -300,6 +327,10 @@ create index if not exists push_subscriptions_player_active_idx
 
 create index if not exists push_notification_log_key_idx
   on public.push_notification_log (notification_key);
+create index if not exists push_alerts_created_idx
+  on public.push_alerts (created_at desc);
+create index if not exists push_notification_log_status_idx
+  on public.push_notification_log (status, sent_at desc);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('tennis-media', 'tennis-media', false, 52428800, array['image/*','video/*'])
