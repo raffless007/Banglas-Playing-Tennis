@@ -154,7 +154,7 @@ create table if not exists public.media_items (
 
 create table if not exists public.audit_log (
   id uuid primary key default gen_random_uuid(), created_at timestamptz not null default now(),
-  actor_player_id uuid references public.players(id), actor_type text not null default 'system',
+  actor_player_id uuid references public.players(id), actor_type text not null default 'system', actor_name text,
   action text not null, target_type text, target_id uuid, outcome text not null default 'success',
   details jsonb not null default '{}'::jsonb, before_state jsonb, after_state jsonb
 );

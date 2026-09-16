@@ -65,6 +65,7 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase private service-role/secret key |
 | `ADMIN_SESSION_SECRET` | A long random value of at least 32 characters |
 | `INITIAL_ADMIN_PASSCODE` | The first 4–8 digit admin passcode |
+| `ADMIN_DISPLAY_NAME` | Name shown for admin actions in the activity audit log |
 | `VAPID_PUBLIC_KEY` | Public Web Push VAPID key |
 | `VAPID_PRIVATE_KEY` | Private Web Push VAPID key — keep this secret |
 | `VAPID_SUBJECT` | A contact URI, e.g. `mailto:rsiddiquey@gmail.com` |

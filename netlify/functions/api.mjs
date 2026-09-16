@@ -18,6 +18,9 @@ const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+// The app currently has one shared admin passcode. Set ADMIN_DISPLAY_NAME in
+// Netlify to identify the admin in the append-only activity history.
+const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -74,10 +77,16 @@ async function mediaUrl(path) {
   return data.signedUrl;
 }
 
-function auditActor(req) {
-  if (isAdmin(req)) return { actor_type: "admin", actor_player_id: null };
+async function auditActor(req) {
+  if (isAdmin(req)) return { actor_type: "admin", actor_player_id: null, actor_name: ADMIN_DISPLAY_NAME };
   const playerId = playerSessionSubject(req);
-  return { actor_type: playerId ? "player" : "anonymous", actor_player_id: playerId || null };
+  if (!playerId) return { actor_type: "anonymous", actor_player_id: null, actor_name: "Anonymous visitor" };
+  let actorName = null;
+  try {
+    const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&select=name`);
+    actorName = rows?.[0]?.name || null;
+  } catch { /* Keep the audit write working even if the roster lookup fails. */ }
+  return { actor_type: "player", actor_player_id: playerId, actor_name: actorName || "Unknown player" };
 }
 
 function auditSafe(value) {
@@ -92,12 +101,20 @@ function auditSafe(value) {
 
 async function writeAudit(req, action, body, outcome = "success", beforeState = null, afterState = null) {
   try {
-    const actor = auditActor(req);
-    await db("audit_log", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({
+    const actor = await auditActor(req);
+    const payload = {
       ...actor, action, target_type: body?.eventId ? "event" : body?.playerId ? "player" : body?.mediaId ? "media" : body?.scoreId ? "score" : null,
       target_id: body?.eventId || body?.playerId || body?.mediaId || body?.scoreId || null, outcome,
       details: auditSafe(body || {}), before_state: auditSafe(beforeState), after_state: auditSafe(afterState),
-    }) });
+    };
+    try {
+      await db("audit_log", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(payload) });
+    } catch (error) {
+      // Keep logging working during the brief window before migration 020 is applied.
+      if (!Object.prototype.hasOwnProperty.call(payload, "actor_name")) throw error;
+      delete payload.actor_name;
+      await db("audit_log", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(payload) });
+    }
   } catch (error) { console.error("Audit log failed", error); }
 }
 
@@ -1098,7 +1115,32 @@ async function updatePlayer(body) {
 
 async function adminAuditLog() {
   const rows = await db("audit_log?select=*&order=created_at.desc&limit=200");
-  return reply({ ok: true, rows });
+  const [players, events, media, scores] = await Promise.all([
+    db("players?select=id,name"),
+    db("events?select=id,event_date,location,suburb"),
+    db("media_items?select=id,title"),
+    db("match_scores?select=id,event_id"),
+  ]);
+  const playerNames = new Map((players || []).map(player => [player.id, player.name]));
+  const eventNames = new Map((events || []).map(event => [event.id, `${event.event_date} · ${event.location}${event.suburb ? `, ${event.suburb}` : ""}`]));
+  const mediaNames = new Map((media || []).map(item => [item.id, item.title]));
+  const scoreEvents = new Map((scores || []).map(score => [score.id, eventNames.get(score.event_id) || "Saved match"]));
+  const enriched = (rows || []).map(row => {
+    const details = row.details || {};
+    const subjectId = details.playerId || details.player_id || details.submittedBy || details.submitted_by;
+    const targetName = row.target_type === "event" ? eventNames.get(row.target_id)
+      : row.target_type === "player" ? playerNames.get(row.target_id)
+      : row.target_type === "media" ? mediaNames.get(row.target_id)
+      : row.target_type === "score" ? scoreEvents.get(row.target_id)
+      : null;
+    return {
+      ...row,
+      actor_name: row.actor_name || (row.actor_player_id ? playerNames.get(row.actor_player_id) : null) || (row.actor_type === "admin" ? ADMIN_DISPLAY_NAME : "Anonymous visitor"),
+      target_name: targetName || null,
+      subject_name: subjectId ? (playerNames.get(subjectId) || "Unknown player") : null,
+    };
+  });
+  return reply({ ok: true, rows: enriched });
 }
 
 async function adminSetAttendance(body) {
@@ -1159,7 +1201,7 @@ export default async (req) => {
         return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
       }
     }
-    if (req.method === "POST" && action === "eoi") return submitEoi(body);
+    if (req.method === "POST" && action === "eoi") return runAudited(req, action, body, () => submitEoi(body));
     if (req.method === "POST" && action === "paid") return runAudited(req, action, body, () => markPaid(body));
     if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body));
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body, isAdmin(req));
