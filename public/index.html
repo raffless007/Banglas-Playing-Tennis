@@ -103,6 +103,8 @@
       renderWeeks();
       const event=upcoming()[selected];
       if(!event)return;
+      const weather=$('weatherCard'),details=document.querySelector('.event .details');
+      if(weather&&details&&details.previousElementSibling!==weather)details.parentElement.insertBefore(weather,details);
       if(!$('eventQuickActions'))document.querySelector('.response')?.insertAdjacentHTML('afterend','<div id="eventQuickActions" class="card share-row" style="padding:14px;margin-top:14px"></div>');
       $('eventQuickActions').innerHTML='<button id="directionsBtn" class="secondary">Get directions</button><button id="itineraryBtn" class="secondary">Add to calendar</button>';
       $('directionsBtn').onclick=()=>window.open(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${event.location}, ${event.suburb}`)}`,'_blank','noopener');
