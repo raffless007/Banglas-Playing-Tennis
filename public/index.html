@@ -69,6 +69,12 @@
   .avatar-viewer-image{display:block;width:auto;max-width:100%;max-height:62vh;object-fit:contain;margin:18px auto 0;border-radius:18px;background:#eef3ed}
   .avatar-viewer .sub{margin-top:12px}
   .leaderboard .share-row + table{margin-top:18px}
+  .profile-heading{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+  .profile-avatar-large{width:76px;height:76px;flex:0 0 auto;font-size:22px}
+  .profile-contact{margin-top:20px;padding:15px 17px;background:#f2f5ed;border:1px solid var(--line);border-radius:14px}
+  .profile-contact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+  .profile-contact-item{min-width:0}.profile-contact-item small,.profile-contact-item strong{display:block}.profile-contact-item small{font-size:8px;letter-spacing:1px;color:var(--muted);font-weight:900}.profile-contact-item strong{font-size:12px;margin-top:4px;overflow-wrap:anywhere}.profile-contact-item a{color:inherit}
+  @media(max-width:800px){.profile-contact-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -507,6 +513,12 @@
         preview.classList.remove('hidden');
       };
       fileInput.closest('label')?.insertAdjacentHTML('afterend','<small id="profileAvatarPreviewStatus" class="sub" style="display:block;margin-top:8px"></small>');
+    };
+    showPlayerProfile=function(id){
+      const profile=data.players.find(p=>p.id===id),m=playerMetrics(id),partner=[...m.partners.entries()].sort((a,b)=>b[1]-a[1])[0],facts=[partner?`Most common partner: ${playerName(partner[0])} (${partner[1]} match${partner[1]===1?'':'es'}).`:'Most common partner: No partner recorded yet.',...funStatsFacts(m).slice(0,2)],completed=completedEventIds(),events=[...data.events].filter(e=>completed.has(e.id)&&eoi(e.id,id)?.status==='yes').sort((a,b)=>b.event_date.localeCompare(a.event_date)).slice(0,5),canSeeDetails=Boolean(adminToken)||id===currentPlayerId;
+      const details=canSeeDetails?[['MOBILE',profile?.mobile,profile?.mobile?`<a href="tel:${esc(profile.mobile)}">${esc(profile.mobile)}</a>`:'Not added'],['EMAIL',profile?.email,profile?.email?`<a href="mailto:${esc(profile.email)}">${esc(profile.email)}</a>`:'Not added'],['ADDRESS',profile?.address,profile?.address?esc(profile.address):'Not added']].filter(row=>row[1]):[];
+      const contact=canSeeDetails?`<div class="profile-contact"><p class="eyebrow">PROFILE DETAILS</p><div class="profile-contact-grid">${details.length?details.map(row=>`<div class="profile-contact-item"><small>${row[0]}</small><strong>${row[2]}</strong></div>`).join(''):'<p class="sub">No contact details added yet.</p>'}</div></div>`:'<p class="sub" style="margin-top:16px">Contact details are visible to the player and admin only.</p>';
+      $('modalContent').innerHTML=`<div class="profile-heading">${avatarMarkup(profile,'profile-avatar-large')}<div><p class="eyebrow">PLAYER PROFILE</p><h2>${esc(m.name)}</h2></div></div><div class="badgebar">${m.badges.map(b=>`<span class="badgechip">${esc(b)}</span>`).join('')}<span class="oddschip">Rating ${m.rating}</span></div><div class="profile-grid"><div class="tile"><small>PLAYED</small><strong>${m.played}</strong></div><div class="tile"><small>RECORD</small><strong>${m.wins}-${m.losses}</strong></div><div class="tile"><small>WIN %</small><strong>${m.winPct}%</strong></div><div class="tile"><small>PF / PA</small><strong>${m.pointsFor}-${m.pointsAgainst}</strong></div><div class="tile"><small>ATTENDANCE</small><strong>${m.attendance}</strong></div><div class="tile"><small>PAID</small><strong>${m.paid}</strong></div></div>${contact}<div class="profile-facts"><p class="eyebrow">FUN STATS FACTS</p><ul>${facts.map(f=>`<li>${esc(f)}</li>`).join('')}</ul></div><h3 style="margin-top:18px">Recent completed sessions</h3>${events.length?events.map(e=>`<div class="modalrow"><strong>${fmt(new Date(e.event_date+'T12:00:00'))}</strong><span>${sessionStatus(e)}</span></div>`).join(''):'<p class="sub">No completed attendance history yet.</p>'}`;$('modal').classList.remove('hidden');
     };
     (function setupPullToRefresh(){
       const indicator=$('pullRefreshIndicator');
