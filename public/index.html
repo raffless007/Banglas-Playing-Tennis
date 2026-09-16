@@ -483,6 +483,28 @@
     function wireScheduleForm(form,row){if(!form)return;form.querySelector('[data-save-schedule]').onclick=()=>saveAlertScheduleForm(form,row);form.querySelector('[data-cancel-schedule]').onclick=()=>{if(row){form.closest('details').open=false}else{$('newScheduleForm').classList.add('hidden')}};form.querySelector('[data-delete-schedule]')?.addEventListener('click',async()=>{if(!confirm(`Delete “${row.name}”?`))return;try{await request('admin-delete-alert-schedule','POST',{id:row.id},true);notify('Scheduled alert deleted');await renderAdminScheduledAlerts()}catch(error){notify(error.message)}})}
     function enhanceAdminAlerts(){const dashboard=$('dashboard'),tabs=dashboard?.querySelector('.tabs');if(!dashboard||!tabs||!adminToken)return;let alertsButton=tabs.querySelector('[data-tab="alerts"]'),alertsPanel=$('alertsPanel'),created=!alertsButton||!alertsPanel;if(!alertsButton){alertsButton=document.createElement('button');alertsButton.dataset.tab='alerts';alertsButton.textContent='Alerts';tabs.appendChild(alertsButton)}tabs.querySelectorAll('[data-tab="push"],[data-tab="alert"]').forEach(button=>button.classList.add('hidden'));if(!alertsPanel){alertsPanel=document.createElement('div');alertsPanel.id='alertsPanel';alertsPanel.className='panel';dashboard.appendChild(alertsPanel);const subnav=document.createElement('div');subnav.className='alert-subtabs';subnav.innerHTML='<button type="button" data-alert-subtab="push" class="active">Push Alerts</button><button type="button" data-alert-subtab="scheduled">Scheduled Alerts</button><button type="button" data-alert-subtab="alert">Alert Log</button>';const scheduled=document.createElement('div');scheduled.id='scheduledAlertsPanel';scheduled.className='alert-subpanel';alertsPanel.append(subnav,scheduled)}const push=$('pushPanel'),log=$('alertPanel');if(push&&push.parentElement!==alertsPanel){push.classList.add('alert-subpanel');alertsPanel.appendChild(push)}if(log&&log.parentElement!==alertsPanel){log.classList.add('alert-subpanel');alertsPanel.appendChild(log)}const subnav=alertsPanel.querySelector('.alert-subtabs');const subPanels={push:$('pushPanel'),scheduled:$('scheduledAlertsPanel'),alert:$('alertPanel')};subnav?.querySelectorAll('[data-alert-subtab]').forEach(button=>button.onclick=()=>{subnav.querySelectorAll('[data-alert-subtab]').forEach(item=>item.classList.toggle('active',item===button));Object.entries(subPanels).forEach(([key,panel])=>panel?.classList.toggle('active',key===button.dataset.alertSubtab));if(button.dataset.alertSubtab==='scheduled'&&!$('scheduledAlertsPanel').dataset.loaded){$('scheduledAlertsPanel').dataset.loaded='true';renderAdminScheduledAlerts()}});if(created){alertsButton.onclick=()=>{tabs.querySelectorAll('button').forEach(button=>button.classList.toggle('active',button===alertsButton));dashboard.querySelectorAll(':scope > .panel').forEach(panel=>panel.classList.toggle('active',panel===alertsPanel));subnav?.querySelector('[data-alert-subtab="push"]')?.click()}}if(!alertsPanel.classList.contains('active')){} }
     const baseRenderAdmin=renderAdmin;renderAdmin=function(){baseRenderAdmin();enhanceAdminAlerts()};
+    const baseShowEditProfile=showEditProfile;
+    showEditProfile=function(){
+      baseShowEditProfile();
+      const oldPreview=$('profileEditPreview'),fileInput=$('profileAvatarFile');
+      if(!oldPreview||!fileInput)return;
+      const preview=document.createElement('span');
+      preview.id='profileEditPreview';
+      preview.className='avatar avatar-photo hidden';
+      preview.innerHTML='<img alt="Preview">';
+      oldPreview.replaceWith(preview);
+      fileInput.onchange=()=>{
+        const file=fileInput.files?.[0];
+        if(!file)return;
+        if(file.size>5*1024*1024){fileInput.value='';return notify('Display pictures must be 5 MB or smaller.')}
+        const status=$('profileAvatarPreviewStatus');
+        if(status)status.textContent='New display picture selected — save to apply.';
+        const img=preview.querySelector('img');
+        if(img){img.onload=()=>{if(status)status.textContent='New display picture selected — save to apply.'};img.onerror=()=>{if(status)status.textContent='Preview unavailable in this browser. It will still upload when you save.'};img.src=URL.createObjectURL(file)}
+        preview.classList.remove('hidden');
+      };
+      fileInput.closest('label')?.insertAdjacentHTML('afterend','<small id="profileAvatarPreviewStatus" class="sub" style="display:block;margin-top:8px"></small>');
+    };
     (function setupPullToRefresh(){
       const indicator=$('pullRefreshIndicator');
       if(!indicator)return;
