@@ -509,6 +509,18 @@ function liveAdvance(match, winner) {
     if (next.tiebreak_b >= 5 && next.tiebreak_b - next.tiebreak_a >= 2) {
       next.games_b = 4; next.completed = true;
     }
+    // Tie-break serving: the natural next server serves one point, then
+    // serving changes every two points. The player shown is always the server
+    // for the next point, including while the set is waiting to be saved.
+    if (!next.completed) {
+      const played = next.tiebreak_a + next.tiebreak_b;
+      if (played === 1 || (played > 1 && played % 2 === 1)) {
+        const server = nextServer(next);
+        next.server_index = server.serverIndex;
+        next.server_player_id = server.serverId;
+      }
+    }
+    next.game_finished = false;
     return next;
   }
   if (winner === "a") next.point_a++;
@@ -577,12 +589,26 @@ async function updateLiveServer(body, adminOverride = false) {
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   const allPlayers = [...match.team_a_player_ids, ...match.team_b_player_ids];
   if (!allPlayers.includes(body.serverPlayerId)) return reply({ error: "Choose a server from this match." }, 400);
-  const serverOrder = match.server_order || [];
+  let serverOrder = match.server_order || [];
+  // If the scorer corrects either of the two opening servers before the
+  // rotation has moved beyond the opening pair, rebuild the four-player order
+  // around those corrected first servers. Later servers then follow naturally.
+  const gamesPlayed = Number(match.games_a || 0) + Number(match.games_b || 0);
+  if (!match.is_tiebreak && gamesPlayed <= 1 && serverOrder.length === 4) {
+    const teamA = match.team_a_player_ids || [], teamB = match.team_b_player_ids || [];
+    if (teamA.includes(body.serverPlayerId)) {
+      const bFirst = serverOrder.find(id => teamB.includes(id)) || teamB[0];
+      serverOrder = buildServerOrder(teamA, teamB, body.serverPlayerId, bFirst);
+    } else if (teamB.includes(body.serverPlayerId)) {
+      const aFirst = serverOrder.find(id => teamA.includes(id)) || teamA[0];
+      serverOrder = buildServerOrder(teamA, teamB, aFirst, body.serverPlayerId);
+    }
+  }
   const serverIndex = serverOrder.includes(body.serverPlayerId) ? serverOrder.indexOf(body.serverPlayerId) : Number(match.server_index || 0);
   const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false, version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_order: serverOrder, server_index: serverIndex, needs_server_choice: false, version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() }),
   });
   if (!updated?.length) return reply({ error: "This match changed on another device. Refresh and try again." }, 409);
   return reply({ ok: true, match: updated?.[0] || { ...match, server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false } });
