@@ -1273,11 +1273,34 @@ async function updatePlayer(body) {
     if (name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) return reply({ error: "Use letters, numbers, spaces, apostrophes or hyphens only for player names." }, 400);
     update.name = name;
   }
+  if (Object.prototype.hasOwnProperty.call(body, "email")) {
+    const email = String(body.email || "").trim();
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
+    update.email = email || null;
+  }
   if (!body.playerId || !Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
   await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
   });
   return reply({ ok: true });
+}
+
+async function assignGuest(body) {
+  if (!body.playerId || !body.eventId) return reply({ error: "Choose a guest and a week." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Event not found." }, 404);
+  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,active,is_guest,guest_event_id`);
+  const guest = guests?.[0];
+  if (!guest) return reply({ error: "Choose a guest from the archive." }, 404);
+  await db(`players?id=eq.${encodeURIComponent(guest.id)}`, {
+    method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ active: true, guest_event_id: event.id }),
+  });
+  await db("eois?on_conflict=event_id,player_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ event_id: event.id, player_id: guest.id, status: "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true, playerId: guest.id, eventId: event.id });
 }
 
 async function adminAuditLog() {
@@ -1406,7 +1429,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAuditLog();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1417,6 +1440,7 @@ export default async (req) => {
     if (action === "admin-add-guest") return runAudited(req, action, body, () => addGuest(body));
     if (action === "admin-create-guest-invite") return runAudited(req, action, body, () => createGuestInvite(body));
     if (action === "admin-update-player") return runAudited(req, action, body, () => updatePlayer(body));
+    if (action === "admin-assign-guest") return runAudited(req, action, body, () => assignGuest(body));
     if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
     if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));
     if (action === "admin-set-eoi") return runAudited(req, action, body, () => adminSetEoi(body));
