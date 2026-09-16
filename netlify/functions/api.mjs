@@ -361,8 +361,10 @@ async function appState(req) {
     is_guest: player.is_guest,
     guest_event_id: player.guest_event_id,
     guest_of_player_id: player.guest_of_player_id,
+    email: player.email || "",
+    mobile: player.mobile || "",
     avatar_url: player.avatar_path ? await mediaUrl(player.avatar_path) : null,
-    ...(admin || player.id === playerId ? { email: player.email || "", mobile: player.mobile || "", address: player.address || "" } : {}),
+    ...(admin || player.id === playerId ? { address: player.address || "" } : {}),
   })));
   const visiblePayments = payments.map(payment => {
     if (admin || payment.player_id === playerId) return payment;
