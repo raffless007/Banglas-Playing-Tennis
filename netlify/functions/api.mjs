@@ -1401,6 +1401,21 @@ async function updateGuest(body) {
   return reply({ ok: true });
 }
 
+async function promoteGuest(body) {
+  if (!body.playerId) return reply({ error: "Choose a guest." }, 400);
+  const guests = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,active`);
+  const guest = guests?.[0];
+  if (!guest) return reply({ error: "That player is not in the guest archive." }, 404);
+  const conflicts = await db(`players?name=eq.${encodeURIComponent(guest.name)}&is_guest=eq.false&select=id`);
+  if (conflicts?.length) return reply({ error: "A permanent roster player already has that name. Rename the guest first." }, 409);
+  await db(`players?id=eq.${encodeURIComponent(guest.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ active: true, is_guest: false, guest_event_id: null, guest_of_player_id: null }),
+  });
+  return reply({ ok: true, playerId: guest.id, name: guest.name });
+}
+
 async function assignGuest(body) {
   if (!body.playerId || !body.eventId) return reply({ error: "Choose a guest and a week." }, 400);
   const event = await getEvent(body.eventId);
@@ -1555,7 +1570,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAlertLog();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1567,6 +1582,7 @@ export default async (req) => {
     if (action === "admin-create-guest-invite") return runAudited(req, action, body, () => createGuestInvite(body));
     if (action === "admin-update-player") return runAudited(req, action, body, () => updatePlayer(body));
     if (action === "admin-update-guest") return runAudited(req, action, body, () => updateGuest(body));
+    if (action === "admin-promote-guest") return runAudited(req, action, body, () => promoteGuest(body));
     if (action === "admin-assign-guest") return runAudited(req, action, body, () => assignGuest(body));
     if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
     if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));
