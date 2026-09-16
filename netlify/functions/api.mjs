@@ -539,7 +539,7 @@ async function startLiveMatch(body, adminOverride = false) {
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(body.eventId, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
-  const active = await db(`live_matches?event_id=eq.${encodeURIComponent(body.eventId)}&select=id`);
+  const active = await db(`live_matches?event_id=eq.${encodeURIComponent(body.eventId)}&completed=eq.false&select=id`);
   if (active.length) return reply({ error: "Finish or abandon the current live match first." }, 409);
   const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
   const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
@@ -671,6 +671,29 @@ async function abandonLiveMatch(body, adminOverride = false) {
   return reply({ ok: true, matchId: match.id });
 }
 
+async function cleanupLiveMatch(matchId, scoreId = null) {
+  try {
+    await db(`live_matches?id=eq.${encodeURIComponent(matchId)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" },
+    });
+  } catch (error) {
+    // Older databases may still have the original NO ACTION foreign key.
+    // Detach the saved score, then retry cleanup so a completed match cannot
+    // block the next match in the same event.
+    if (!scoreId) throw error;
+    await db(`match_scores?id=eq.${encodeURIComponent(scoreId)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ live_match_id: null, updated_at: new Date().toISOString() }),
+    });
+    await db(`live_matches?id=eq.${encodeURIComponent(matchId)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" },
+    });
+  }
+}
+
 async function finishLiveMatch(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
@@ -685,6 +708,11 @@ async function finishLiveMatch(body, adminOverride = false) {
   const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
+  const existingSaved = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=id`);
+  if (existingSaved?.length) {
+    await cleanupLiveMatch(match.id, existingSaved[0].id);
+    return reply({ ok: true, alreadySaved: true });
+  }
   const endedAt = new Date().toISOString();
   const durationSeconds = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(match.started_at || match.created_at).getTime()) / 1000));
   await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.true`, {
@@ -692,10 +720,11 @@ async function finishLiveMatch(body, adminOverride = false) {
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ ended_at: endedAt, duration_seconds: durationSeconds, updated_at: endedAt }),
   });
+  let savedRows = null;
   try {
-    await db("match_scores", {
+    savedRows = await db("match_scores", {
       method: "POST",
-      headers: { Prefer: "return=minimal" },
+      headers: { Prefer: "return=representation" },
       body: JSON.stringify({
         event_id: match.event_id,
         team_a_player_ids: match.team_a_player_ids,
@@ -715,12 +744,11 @@ async function finishLiveMatch(body, adminOverride = false) {
     });
   } catch (error) {
     if (!/duplicate|unique/i.test(error?.message || "")) throw error;
+    savedRows = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=id`);
   }
-  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}`, {
-    method: "DELETE",
-    headers: { Prefer: "return=minimal" },
-  });
-  return reply({ ok: true });
+  const scoreId = savedRows?.[0]?.id || null;
+  await cleanupLiveMatch(match.id, scoreId);
+  return reply({ ok: true, alreadySaved: !scoreId });
 }
 
 async function submitScore(body) {

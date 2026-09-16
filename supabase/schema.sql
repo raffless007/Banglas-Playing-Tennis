@@ -124,7 +124,7 @@ create table if not exists public.live_matches (
 alter table public.match_scores
   drop constraint if exists match_scores_live_match_id_fkey,
   add constraint match_scores_live_match_id_fkey
-    foreign key (live_match_id) references public.live_matches(id);
+    foreign key (live_match_id) references public.live_matches(id) on delete set null;
 
 create table if not exists public.event_notes (
   event_id uuid primary key references public.events(id) on delete cascade,
