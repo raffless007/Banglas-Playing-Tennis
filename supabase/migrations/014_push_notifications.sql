@@ -31,4 +31,3 @@ create index if not exists push_subscriptions_player_active_idx
   on public.push_subscriptions (player_id, active);
 create index if not exists push_notification_log_key_idx
   on public.push_notification_log (notification_key);
-

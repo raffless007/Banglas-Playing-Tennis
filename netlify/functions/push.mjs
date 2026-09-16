@@ -96,4 +96,3 @@ export async function activePlayerIds() {
   const players = await db("players?active=eq.true&select=id");
   return players.map(player => player.id);
 }
-

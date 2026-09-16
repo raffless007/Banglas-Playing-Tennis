@@ -306,8 +306,12 @@ async function appState(req) {
 }
 
 async function adminState() {
-  const players = await db("players?select=id,name,active,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc");
-  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash })) };
+  const [players, subscriptions] = await Promise.all([
+    db("players?select=id,name,active,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
+    db("push_subscriptions?select=player_id&active=eq.true"),
+  ]);
+  const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })) };
 }
 
 async function playerPinStatus(body) {
