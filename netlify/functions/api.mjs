@@ -284,7 +284,7 @@ async function savePasscode(passcode) {
 async function appState(req) {
   await ensureUpcomingEvents();
   const [players, events, eois, payments, scores, liveMatches, notes, mediaRows] = await Promise.all([
-    db("players?select=id,name,active&order=name.asc"),
+    db("players?select=id,name,active,is_guest,guest_event_id&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
@@ -307,7 +307,7 @@ async function appState(req) {
 
 async function adminState() {
   const [players, subscriptions] = await Promise.all([
-    db("players?select=id,name,active,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
+    db("players?select=id,name,active,email,is_guest,guest_event_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=player_id&active=eq.true"),
   ]);
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
@@ -894,6 +894,93 @@ async function addPlayer(body) {
   return reply({ ok: true });
 }
 
+function validGuestName(name) {
+  return name.length >= 2 && name.length <= 80 && /^[\p{L}\p{N} .'-]+$/u.test(name);
+}
+
+async function createGuestParticipant({ eventId, name, email = null, status = "yes" }) {
+  const existingRows = await db(`players?name=eq.${encodeURIComponent(name)}&select=id,name,active,is_guest,guest_event_id`);
+  let player = existingRows?.[0] || null;
+  if (player) {
+    if (!player.is_guest || player.guest_event_id !== eventId) {
+      return { error: "That name is already on the main roster. Use a different guest name." };
+    }
+    if (email && email !== player.email) {
+      const updated = await db(`players?id=eq.${encodeURIComponent(player.id)}&select=id,name,email,active,is_guest,guest_event_id`, {
+        method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ email }),
+      });
+      player = updated?.[0] || player;
+    }
+  } else {
+    const created = await db("players", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ name, email: email || null, active: true, is_guest: true, guest_event_id: eventId }),
+    });
+    player = created?.[0] || null;
+  }
+  if (!player) return { error: "The guest could not be added." };
+  await db("eois?on_conflict=event_id,player_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ event_id: eventId, player_id: player.id, status: status === "no" ? "no" : "yes", waitlist_position: null, updated_at: new Date().toISOString() }),
+  });
+  return { player };
+}
+
+async function addGuest(body) {
+  if (!body.eventId) return reply({ error: "Choose a week for the guest." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Event not found." }, 404);
+  const name = String(body.name || "").trim();
+  const email = String(body.email || "").trim() || null;
+  if (!validGuestName(name)) return reply({ error: "Use a guest name with 2–80 letters, numbers, spaces, apostrophes or hyphens." }, 400);
+  if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
+  const result = await createGuestParticipant({ eventId: event.id, name, email, status: "yes" });
+  if (result.error) return reply({ error: result.error }, 409);
+  return reply({ ok: true, player: result.player });
+}
+
+async function createGuestInvite(body) {
+  if (!body.eventId) return reply({ error: "Choose a week for the invite." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event) return reply({ error: "Event not found." }, 404);
+  let token = event.guest_invite_token;
+  if (!token) {
+    token = randomBytes(24).toString("base64url");
+    await db(`events?id=eq.${encodeURIComponent(event.id)}`, {
+      method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ guest_invite_token: token }),
+    });
+  }
+  const origin = String(process.env.APP_URL || "https://banglasplayingtennis.netlify.app").replace(/\/$/, "");
+  return reply({ ok: true, eventId: event.id, token, url: `${origin}/?guest=${encodeURIComponent(event.id)}&invite=${encodeURIComponent(token)}` });
+}
+
+async function guestInviteInfo(body) {
+  if (!body.eventId || !body.token) return reply({ error: "This guest invite is incomplete." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event || event.guest_invite_token !== body.token) return reply({ error: "This guest invite is invalid or expired." }, 404);
+  return reply({ ok: true, event: {
+    id: event.id, event_date: event.event_date, start_time: event.start_time, end_time: event.end_time,
+    location: event.location, suburb: event.suburb, court_1_name: event.court_1_name,
+    court_2_enabled: event.court_2_enabled, court_2_name: event.court_2_name,
+    court_2_start_time: event.court_2_start_time, court_2_end_time: event.court_2_end_time,
+  } });
+}
+
+async function guestRsvp(body) {
+  if (!body.eventId || !body.token) return reply({ error: "This guest invite is incomplete." }, 400);
+  const event = await getEvent(body.eventId);
+  if (!event || event.guest_invite_token !== body.token) return reply({ error: "This guest invite is invalid or expired." }, 404);
+  const name = String(body.name || "").trim();
+  const email = String(body.email || "").trim() || null;
+  if (!validGuestName(name)) return reply({ error: "Use a guest name with 2–80 letters, numbers, spaces, apostrophes or hyphens." }, 400);
+  if (email && !/^\S+@\S+\.\S+$/.test(email)) return reply({ error: "Enter a valid email address, or leave it blank." }, 400);
+  const result = await createGuestParticipant({ eventId: event.id, name, email, status: body.status === "no" ? "no" : "yes" });
+  if (result.error) return reply({ error: result.error }, 409);
+  return reply({ ok: true, name: result.player.name, status: body.status === "no" ? "no" : "yes" });
+}
+
 async function removePlayer(body) {
   await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ active: false }),
@@ -1222,6 +1309,8 @@ export default async (req) => {
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
+    if (req.method === "POST" && action === "guest-invite-info") return guestInviteInfo(body);
+    if (req.method === "POST" && action === "guest-rsvp") return guestRsvp(body);
 
     if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
 
@@ -1261,7 +1350,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAuditLog();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
@@ -1269,6 +1358,8 @@ export default async (req) => {
     if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body));
     if (action === "admin-delete-event") return runAudited(req, action, body, () => deleteEvent(body));
     if (action === "admin-add-player") return runAudited(req, action, body, () => addPlayer(body));
+    if (action === "admin-add-guest") return runAudited(req, action, body, () => addGuest(body));
+    if (action === "admin-create-guest-invite") return runAudited(req, action, body, () => createGuestInvite(body));
     if (action === "admin-update-player") return runAudited(req, action, body, () => updatePlayer(body));
     if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
     if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));
