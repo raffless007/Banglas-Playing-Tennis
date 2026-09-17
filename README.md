@@ -28,6 +28,9 @@ be run before deploying the matching app/API update.
 `033_webauthn_passkeys.sql` adds the private credential and one-time challenge
 tables required for passkey registration and sign-in. Run it before enabling
 passkeys in production.
+`034_experience_reliability.sql` adds soft-delete event protection, RSVP change
+history, sync versioning, offline-score backup tables, backup metadata and
+defensive constraints. Run it after the earlier migrations.
 
 ## 2. Upload this project to GitHub
 
@@ -45,6 +48,7 @@ supabase/migrations/002_court_fee.sql
 supabase/migrations/003_update_upcoming_court_fees.sql
 supabase/migrations/004_second_court_and_media.sql
 supabase/migrations/033_webauthn_passkeys.sql
+supabase/migrations/034_experience_reliability.sql
 netlify.toml
 package.json
 .gitignore
@@ -69,6 +73,7 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 | Variable | Value |
 | --- | --- |
 | `SUPABASE_URL` | Supabase **Project Settings → API → Project URL** |
+| `SUPABASE_ANON_KEY` | Optional public anon/publishable key for low-latency Realtime sync; never use the service role key here |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase private service-role/secret key |
 | `ADMIN_SESSION_SECRET` | A long random value of at least 32 characters |
 | `INITIAL_ADMIN_PASSCODE` | The first 4–8 digit admin passcode |
@@ -101,7 +106,7 @@ production deployment.
 - Payment confirmation stays locked until that week's configured session end.
 - After the session, only players marked **In** can confirm payment.
 - Each player pays `total active court fees ÷ In players + ball fee`.
-- The Media tab accepts images and videos up to 200 MB from any selected player.
+- The Media tab accepts images and videos up to 50 MB after automatic, quality-preserving compression when needed.
 - Media is sorted by date, displayed as gallery tiles and available for download.
 - Admin can permanently remove an incorrect media upload.
 - Weekly scores are visible to everyone, but only players marked **In** can add them.
@@ -118,6 +123,9 @@ production deployment.
 - Players can separately opt into payment, EOI, session and match/tournament updates.
 - Players can register, rename and remove passkeys from their profile security settings.
 - The player chooser offers discoverable passkey sign-in, with the PIN kept as a fallback.
+- The app shows a live-sync indicator, retries transient media uploads, and queues live-score points while offline.
+- Admin can download a JSON backup from Settings; backup attempts are recorded without storing secrets.
+- Completed events can be filtered safely after a soft delete, and RSVP changes are retained in history.
 - The hourly push job sends EOI notices at 24 hours and one hour before the deadline,
   plus payment notices when the session ends and after 48 hours if still unpaid.
 - Saving an event notifies opted-in players about session changes; deleting one sends a cancellation.

@@ -26,6 +26,9 @@ const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+// Optional publishable key used only by the browser for low-latency sync. The
+// service-role key is never returned to clients.
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || "";
 // The app currently has one shared admin passcode. Set ADMIN_DISPLAY_NAME in
 // Netlify to identify the admin in the append-only activity history.
 const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
@@ -241,6 +244,8 @@ async function ensureUpcomingEvents() {
     }
     const now = datePartsInSydney();
     const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
+    // Migrate only legacy upcoming rows that still carry the old default. An
+    // explicitly edited fee is never overwritten because this targets 52 only.
     await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
@@ -336,6 +341,16 @@ async function getEvent(eventId) {
   return rows?.[0];
 }
 
+async function listVisibleEvents() {
+  try {
+    return await db("events?deleted_at=is.null&select=*&order=event_date.asc");
+  } catch {
+    // Keep the app compatible during the short window before the migration is
+    // applied to an existing Supabase project.
+    return db("events?select=*&order=event_date.asc");
+  }
+}
+
 async function getPasscodeSetting() {
   const rows = await db("app_settings?key=eq.admin_passcode_hash&select=value");
   return rows?.[0]?.value || null;
@@ -353,7 +368,7 @@ async function appState(req) {
   await ensureUpcomingEvents();
   const [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
-    db("events?select=*&order=event_date.asc"),
+    listVisibleEvents(),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
     db("match_scores?select=*&order=created_at.asc"),
@@ -421,7 +436,7 @@ async function eoiState() {
 async function adminState() {
   const [players, subscriptions, badges] = await Promise.all([
     db("players?select=id,name,active,email,is_guest,guest_event_id,guest_of_player_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
-    db("push_subscriptions?select=player_id&active=eq.true"),
+    db("push_subscriptions?select=id,player_id,endpoint,active,updated_at,created_at&active=eq.true"),
     db("badges?select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
   let guestHistory = [];
@@ -432,7 +447,48 @@ async function adminState() {
     // existing roster controls usable until it is run.
   }
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
-  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id) })), guestHistory, badges };
+  const pushDevices = (subscriptions || []).reduce((map, subscription) => {
+    const list = map.get(subscription.player_id) || [];
+    list.push({ id: subscription.id, endpoint: subscription.endpoint, updated_at: subscription.updated_at, created_at: subscription.created_at });
+    map.set(subscription.player_id, list);
+    return map;
+  }, new Map());
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id), push_devices: pushDevices.get(player.id) || [] })), guestHistory, badges };
+}
+
+async function syncVersion() {
+  try {
+    const rows = await db("app_sync_state?id=eq.clubhouse&select=version,updated_at");
+    return reply({ version: rows?.[0]?.version || 0, updatedAt: rows?.[0]?.updated_at || null, serverNow: new Date().toISOString() });
+  } catch {
+    // Before migration 034 is applied, let the client keep using its existing
+    // polling loops instead of turning a missing optional table into an error.
+    return reply({ version: 0, updatedAt: null, serverNow: new Date().toISOString(), fallback: true });
+  }
+}
+
+async function adminBackup(req) {
+  if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
+  const tables = {
+    // Explicit projections prevent PIN hashes, invite tokens and other
+    // authentication material from ever entering an exported backup.
+    players: "players?select=id,name,email,mobile,address,avatar_path,is_guest,guest_event_id,guest_of_player_id,active,created_at,pin_updated_at&order=name.asc",
+    events: "events?select=id,event_date,start_time,end_time,timezone,court_1_name,location,suburb,court_fee,court_2_enabled,court_2_name,court_2_start_time,court_2_end_time,court_2_fee,ball_fee,account_closed,max_players,cancellation_status,cancellation_reason,recap_notes,award_player_id,template_name,deleted_at,created_at,updated_at&order=event_date.asc",
+    eois: "eois?select=*",
+    payments: "payments?select=*",
+    scores: "match_scores?select=*&order=created_at.asc",
+    liveMatches: "live_matches?select=*",
+    media: "media_items?select=*&order=created_at.asc",
+    auditLog: "audit_log?select=*&order=created_at.asc",
+    badges: "badges?select=*&order=sort_order.asc",
+  };
+  const entries = await Promise.all(Object.entries(tables).map(async ([key, query]) => [key, await db(query)]));
+  const payload = Object.fromEntries(entries);
+  await db("admin_backup_runs", {
+    method: "POST", headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ requested_by: ADMIN_DISPLAY_NAME, table_counts: Object.fromEntries(Object.entries(payload).map(([key, rows]) => [key, Array.isArray(rows) ? rows.length : 0])) }),
+  }).catch(() => {});
+  return reply({ generatedAt: new Date().toISOString(), schemaVersion: "034", tables: payload });
 }
 
 function badgePayload(body) {
@@ -1265,10 +1321,17 @@ async function deleteEvent(body) {
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_date: event.event_date, deleted_at: new Date().toISOString() }),
   });
-  await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
-    method: "DELETE",
-    headers: { Prefer: "return=minimal" },
-  });
+  try {
+    await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+    });
+  } catch {
+    // Legacy projects without deleted_at retain the historical hard-delete
+    // behaviour; deleted_event_dates still prevents regeneration.
+    await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  }
   try {
     await createPlayerNotifications(playerIds.map(player_id => ({ player_id, event_id: event.id, notification_type: "session", title: "Tennis session cancelled", body: `${eventLabel(event)} at ${event.location} has been cancelled.`, url: `/?page=play&event=${encodeURIComponent(event.id)}`, dedupe_key: `session-cancelled:${event.id}` })));
     await notifyPlayers({ playerIds, notificationType: "session", notificationKey: `session-cancelled:${event.id}`, eventId: event.id, title: "Tennis session cancelled", body: `${eventLabel(event)} at ${event.location} has been cancelled.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
@@ -2031,6 +2094,8 @@ export default async (req) => {
     if (req.method === "POST" && action === "guest-rsvp") return guestRsvp(body);
 
     if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
+    if (req.method === "GET" && action === "realtime-config") return reply({ configured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY), url: SUPABASE_URL || null, anonKey: SUPABASE_ANON_KEY || null });
+    if (req.method === "GET" && action === "sync-version") return syncVersion();
 
     const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete"];
     if (playerActions.includes(action)) {
@@ -2072,6 +2137,7 @@ export default async (req) => {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return reply(await adminState());
     }
+    if (req.method === "GET" && action === "admin-backup") return adminBackup(req);
 
     if (req.method === "GET" && action === "admin-audit-log") {
       if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
