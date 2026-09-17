@@ -576,3 +576,18 @@ begin
     execute format('create trigger %I after insert or update or delete on public.%I for each row execute function public.bump_app_sync_state()', 'app_sync_' || table_name, table_name);
   end loop;
 end $$;
+
+-- Per-device player sessions. Each login has an isolated server-tracked token.
+create table if not exists public.player_sessions (
+  id uuid primary key default gen_random_uuid(),
+  player_id uuid not null references public.players(id) on delete cascade,
+  session_id uuid not null unique,
+  device_label text,
+  created_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  revoked_at timestamptz
+);
+create index if not exists player_sessions_player_idx on public.player_sessions(player_id, last_seen_at desc);
+create index if not exists player_sessions_active_idx on public.player_sessions(session_id) where revoked_at is null;
+alter table public.player_sessions enable row level security;
+revoke all on public.player_sessions from anon, authenticated;

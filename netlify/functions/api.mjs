@@ -21,7 +21,9 @@ const INITIAL_PASSCODE = process.env.INITIAL_ADMIN_PASSCODE || "1234";
 const SYDNEY = "Australia/Sydney";
 const MEDIA_BUCKET = "tennis-media";
 const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
-const MEDIA_TOTAL_BYTES = 1024 * 1024 * 1024;
+// Application-level gallery quota. Supabase Storage remains responsible for
+// its own provider plan limits; this is the quota enforced by the API.
+const MEDIA_TOTAL_BYTES = 5 * 1024 * 1024 * 1024;
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
@@ -291,10 +293,22 @@ function signSession() {
   return `${payload}.${signature}`;
 }
 
-function signPlayerSession(playerId) {
-  const payload = Buffer.from(JSON.stringify({ type: "player", sub: playerId, iat: Date.now(), exp: Date.now() + 30 * 24 * 60 * 60 * 1000 })).toString("base64url");
+function signPlayerSession(playerId, sessionId = null) {
+  const payload = Buffer.from(JSON.stringify({ type: "player", sub: playerId, sid: sessionId || undefined, iat: Date.now(), exp: Date.now() + 30 * 24 * 60 * 60 * 1000 })).toString("base64url");
   const signature = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
   return `${payload}.${signature}`;
+}
+
+async function issuePlayerSession(playerId, deviceLabel = null) {
+  const sessionId = randomUUID();
+  try {
+    await db("player_sessions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ player_id: playerId, session_id: sessionId, device_label: deviceLabel }) });
+    return signPlayerSession(playerId, sessionId);
+  } catch (error) {
+    // Keep existing installations usable until migration 035 is applied.
+    console.error("Player session tracking unavailable", error?.message || error);
+    return signPlayerSession(playerId);
+  }
 }
 
 function playerSessionSubject(req) {
@@ -330,6 +344,11 @@ async function isPlayer(req, playerId) {
   try {
     const session = JSON.parse(Buffer.from(payload, "base64url").toString());
     if (session.type !== "player" || session.sub !== playerId || session.exp <= Date.now()) return false;
+    if (session.sid) {
+      const active = await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}&player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null&select=session_id`);
+      if (!active?.length) return false;
+      await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
+    }
     const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=pin_updated_at`);
     const pinUpdatedAt = Date.parse(rows?.[0]?.pin_updated_at || "");
     return !!rows?.length && (!Number.isFinite(pinUpdatedAt) || pinUpdatedAt <= Number(session.iat || 0));
@@ -564,7 +583,7 @@ async function createPlayerPin(body) {
     body: JSON.stringify({ pin_hash: passcodeHash(pin), pin_updated_at: now }),
   });
   if (!updated?.length) return reply({ error: "This player already has a PIN. Enter it to continue, or ask the admin to reset it." }, 409);
-  return reply({ ok: true, token: signPlayerSession(body.playerId) });
+  return reply({ ok: true, token: await issuePlayerSession(body.playerId, "PIN setup") });
 }
 
 async function playerLogin(body) {
@@ -587,7 +606,7 @@ async function playerLogin(body) {
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ pin_failed_attempts: 0, pin_locked_at: null }),
   });
-  return reply({ ok: true, token: signPlayerSession(player.id) });
+  return reply({ ok: true, token: await issuePlayerSession(player.id, "PIN login") });
 }
 
 function webauthnContext(req) {
@@ -736,7 +755,7 @@ async function passkeyAuthenticationVerify(req, body) {
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ counter: verification.authenticationInfo.newCounter, last_used_at: new Date().toISOString() }),
   });
-  return reply({ ok: true, playerId: stored.player_id, token: signPlayerSession(stored.player_id) });
+  return reply({ ok: true, playerId: stored.player_id, token: await issuePlayerSession(stored.player_id, "Passkey login") });
 }
 
 async function listPasskeys(body) {
@@ -1717,7 +1736,7 @@ async function createMediaUpload(body) {
   const used = await mediaUsageBytes();
   if (used + fileSize > MEDIA_TOTAL_BYTES) {
     const remainingMb = Math.max(0, Math.floor((MEDIA_TOTAL_BYTES - used) / 1024 / 1024));
-    return reply({ error: `This upload would exceed the 1 GB gallery limit. Remaining space: about ${remainingMb} MB.` }, 409);
+    return reply({ error: `This upload would exceed the 5 GB gallery limit. Remaining space: about ${remainingMb} MB.` }, 409);
   }
   const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
   if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
