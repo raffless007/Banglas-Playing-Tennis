@@ -452,6 +452,38 @@ create unique index if not exists reminder_log_event_type_owner_unique
   where player_id is null
     and reminder_type = '72_hour_owner';
 
+-- WebAuthn/passkeys (Face ID, Touch ID, Android biometrics and security keys).
+create table if not exists public.passkeys (
+  id uuid primary key default gen_random_uuid(),
+  player_id uuid not null references public.players(id) on delete cascade,
+  credential_id text not null unique,
+  public_key text not null,
+  counter bigint not null default 0,
+  transports jsonb not null default '[]'::jsonb,
+  friendly_name text not null default 'This device',
+  device_type text,
+  backed_up boolean not null default false,
+  last_used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+alter table public.passkeys enable row level security;
+revoke all on public.passkeys from anon, authenticated;
+create index if not exists passkeys_player_idx on public.passkeys(player_id);
+
+create table if not exists public.webauthn_challenges (
+  id uuid primary key default gen_random_uuid(),
+  player_id uuid references public.players(id) on delete cascade,
+  challenge_type text not null check (challenge_type in ('registration', 'authentication')),
+  challenge text not null,
+  expires_at timestamptz not null,
+  consumed_at timestamptz,
+  created_at timestamptz not null default now()
+);
+alter table public.webauthn_challenges enable row level security;
+revoke all on public.webauthn_challenges from anon, authenticated;
+create index if not exists webauthn_challenges_expiry_idx
+  on public.webauthn_challenges(expires_at, consumed_at);
+
 insert into public.players (name) values
   ('Abrar Hussain Taif'),
   ('Nabil Mohsin'),

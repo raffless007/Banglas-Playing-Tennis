@@ -3,7 +3,10 @@
 This repository deploys the public website to Netlify and stores shared EOIs,
 events, payments, scores, media, roster details and the admin passcode in Supabase.
 
-Players do not need an account. They choose their name from the roster.
+Players can use the existing roster/PIN flow, then optionally register a
+passkey. Passkeys use Face ID, Touch ID, Android biometrics, Windows Hello or
+a security key and allow a player to sign in on another device without
+re-entering their PIN.
 
 ## 1. Create the database
 
@@ -22,6 +25,9 @@ events still using the old $52 value to $54, while preserving other admin-set fe
 `004_second_court_and_media.sql` adds optional second-court fields, the media
 archive table, and a public `tennis-media` Storage bucket. This migration must
 be run before deploying the matching app/API update.
+`033_webauthn_passkeys.sql` adds the private credential and one-time challenge
+tables required for passkey registration and sign-in. Run it before enabling
+passkeys in production.
 
 ## 2. Upload this project to GitHub
 
@@ -38,6 +44,7 @@ supabase/migrations/001_add_scores.sql
 supabase/migrations/002_court_fee.sql
 supabase/migrations/003_update_upcoming_court_fees.sql
 supabase/migrations/004_second_court_and_media.sql
+supabase/migrations/033_webauthn_passkeys.sql
 netlify.toml
 package.json
 .gitignore
@@ -69,6 +76,9 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 | `VAPID_PUBLIC_KEY` | Public Web Push VAPID key |
 | `VAPID_PRIVATE_KEY` | Private Web Push VAPID key — keep this secret |
 | `VAPID_SUBJECT` | A contact URI, e.g. `mailto:rsiddiquey@gmail.com` |
+| `WEBAUTHN_RP_NAME` | Human-readable passkey name, normally `Banglas Playing Tennis` |
+| `WEBAUTHN_RP_ID` | Stable hostname, normally `banglasplayingtennis.netlify.app` (do not change after enrollment) |
+| `WEBAUTHN_ORIGINS` | Comma-separated allowed origins, e.g. `https://banglasplayingtennis.netlify.app` |
 
 Never put the service-role key or VAPID private key in `public/index.html`,
 GitHub, or any browser code. After adding variables, trigger a new Netlify
@@ -106,6 +116,8 @@ production deployment.
 - Admin can rename roster players, correct paid/unpaid status and delete incorrect scores.
 - Players can enable mobile push notifications per device after entering their PIN.
 - Players can separately opt into payment, EOI, session and match/tournament updates.
+- Players can register, rename and remove passkeys from their profile security settings.
+- The player chooser offers discoverable passkey sign-in, with the PIN kept as a fallback.
 - The hourly push job sends EOI notices at 24 hours and one hour before the deadline,
   plus payment notices when the session ends and after 48 hours if still unpaid.
 - Saving an event notifies opted-in players about session changes; deleting one sends a cancellation.
@@ -113,7 +125,8 @@ production deployment.
 
 ## Important identity limitation
 
-Players choose their roster name and use a personal PIN rather than a full
-account. The first person to claim an unconfigured roster name can set its PIN,
-so the admin should reset it if a name is claimed incorrectly. A future email
-or phone verification step would provide stronger identity proof.
+The first person to claim an unconfigured roster name can set its PIN, so the
+admin should reset it if a name is claimed incorrectly. A passkey is bound to
+that roster profile after the PIN login and provides phishing-resistant device
+authentication from then on. Keep `WEBAUTHN_RP_ID` stable; changing it makes
+existing passkeys unusable and requires re-enrollment.

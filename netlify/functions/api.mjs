@@ -6,6 +6,12 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from "@simplewebauthn/server";
 import { activePlayerIds, notifyPlayers, pushConfigured } from "./push.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -23,6 +29,9 @@ const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 // The app currently has one shared admin passcode. Set ADMIN_DISPLAY_NAME in
 // Netlify to identify the admin in the append-only activity history.
 const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
+const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || "Banglas Playing Tennis";
+const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || "";
+const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean);
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -335,7 +344,7 @@ async function getPasscodeSetting() {
 async function savePasscode(passcode) {
   await db("app_settings?on_conflict=key", {
     method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ key: "admin_passcode_hash", value: passcodeHash(passcode), updated_at: new Date().toISOString() }),
   });
 }
@@ -522,6 +531,176 @@ async function playerLogin(body) {
     body: JSON.stringify({ pin_failed_attempts: 0, pin_locked_at: null }),
   });
   return reply({ ok: true, token: signPlayerSession(player.id) });
+}
+
+function webauthnContext(req) {
+  const requestUrl = new URL(req.url);
+  const rpID = WEBAUTHN_RP_ID || requestUrl.hostname;
+  const origins = WEBAUTHN_ORIGINS.length ? WEBAUTHN_ORIGINS : [requestUrl.origin];
+  return { rpID, origins };
+}
+
+async function saveWebAuthnChallenge({ playerId = null, challengeType, challenge }) {
+  await db(`webauthn_challenges?expires_at=lt.${encodeURIComponent(new Date().toISOString())}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  }).catch(() => {});
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const rows = await db("webauthn_challenges", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ player_id: playerId, challenge_type: challengeType, challenge, expires_at: expiresAt }),
+  });
+  return { id: rows?.[0]?.id, expiresAt };
+}
+
+async function consumeWebAuthnChallenge(id, challengeType, playerId = null) {
+  if (!id) return null;
+  const query = `id=eq.${encodeURIComponent(id)}&challenge_type=eq.${encodeURIComponent(challengeType)}&consumed_at=is.null&expires_at=gt.${encodeURIComponent(new Date().toISOString())}`;
+  const rows = await db(`webauthn_challenges?${query}&select=*`);
+  const challenge = rows?.[0];
+  if (!challenge || (playerId && challenge.player_id !== playerId)) return null;
+  const updated = await db(`webauthn_challenges?id=eq.${encodeURIComponent(id)}&consumed_at=is.null&select=id`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ consumed_at: new Date().toISOString() }),
+  });
+  return updated?.length ? challenge : null;
+}
+
+function credentialForVerification(row) {
+  return {
+    id: row.credential_id,
+    publicKey: new Uint8Array(Buffer.from(row.public_key, "base64url")),
+    counter: Number(row.counter || 0),
+    transports: Array.isArray(row.transports) ? row.transports : [],
+  };
+}
+
+async function passkeyRegistrationOptions(req, body) {
+  const playerId = String(body.playerId || "");
+  const players = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&is_guest=eq.false&select=id,name,email`);
+  const player = players?.[0];
+  if (!player) return reply({ error: "Choose an active player profile first." }, 404);
+  const { rpID } = webauthnContext(req);
+  const existing = await db(`passkeys?player_id=eq.${encodeURIComponent(playerId)}&select=credential_id,transports`);
+  const options = await generateRegistrationOptions({
+    rpName: WEBAUTHN_RP_NAME,
+    rpID,
+    userID: Buffer.from(playerId),
+    userName: player.email || `player-${playerId.slice(0, 8)}`,
+    userDisplayName: player.name,
+    attestationType: "none",
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+    excludeCredentials: (existing || []).map(row => ({ id: row.credential_id, transports: row.transports || [] })),
+  });
+  const challenge = await saveWebAuthnChallenge({ playerId, challengeType: "registration", challenge: options.challenge });
+  return reply({ ok: true, challengeId: challenge.id, options });
+}
+
+async function passkeyRegistrationVerify(req, body) {
+  const playerId = String(body.playerId || "");
+  const challenge = await consumeWebAuthnChallenge(body.challengeId, "registration", playerId);
+  if (!challenge) return reply({ error: "This passkey setup request expired. Start again." }, 409);
+  const { rpID, origins } = webauthnContext(req);
+  let verification;
+  try {
+    verification = await verifyRegistrationResponse({
+      response: body.credential,
+      expectedChallenge: challenge.challenge,
+      expectedOrigin: origins,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+    });
+  } catch (error) {
+    console.error("Passkey registration verification failed", error);
+    return reply({ error: "The passkey could not be verified. Please try again." }, 400);
+  }
+  if (!verification.verified || !verification.registrationInfo) return reply({ error: "The passkey could not be verified." }, 400);
+  const info = verification.registrationInfo;
+  const credential = info.credential;
+  const friendlyName = String(body.friendlyName || "This device").trim().slice(0, 120) || "This device";
+  try {
+    await db("passkeys", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      player_id: playerId,
+      credential_id: credential.id,
+      public_key: Buffer.from(credential.publicKey).toString("base64url"),
+      counter: credential.counter || 0,
+      transports: credential.transports || [],
+      friendly_name: friendlyName,
+      device_type: info.credentialDeviceType,
+      backed_up: !!info.credentialBackedUp,
+    }),
+    });
+  } catch (error) {
+    if (/duplicate|unique/i.test(error?.message || "")) return reply({ error: "That passkey is already registered. Use a different device passkey." }, 409);
+    throw error;
+  }
+  return reply({ ok: true, passkey: { friendlyName, deviceType: info.credentialDeviceType } });
+}
+
+async function passkeyAuthenticationOptions(req) {
+  const { rpID } = webauthnContext(req);
+  const options = await generateAuthenticationOptions({ rpID, userVerification: "required" });
+  const challenge = await saveWebAuthnChallenge({ challengeType: "authentication", challenge: options.challenge });
+  return reply({ ok: true, challengeId: challenge.id, options });
+}
+
+async function passkeyAuthenticationVerify(req, body) {
+  const challenge = await consumeWebAuthnChallenge(body.challengeId, "authentication");
+  if (!challenge) return reply({ error: "This passkey sign-in request expired. Start again." }, 409);
+  const credentialId = String(body.credential?.id || "");
+  const rows = await db(`passkeys?credential_id=eq.${encodeURIComponent(credentialId)}&select=*`);
+  const stored = rows?.[0];
+  if (!stored) return reply({ error: "That passkey is not registered for this club." }, 401);
+  const owners = await db(`players?id=eq.${encodeURIComponent(stored.player_id)}&active=eq.true&is_guest=eq.false&select=id`);
+  if (!owners?.length) return reply({ error: "This player profile is no longer active. Please contact the admin." }, 403);
+  const { rpID, origins } = webauthnContext(req);
+  let verification;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: body.credential,
+      expectedChallenge: challenge.challenge,
+      expectedOrigin: origins,
+      expectedRPID: rpID,
+      credential: credentialForVerification(stored),
+      requireUserVerification: true,
+    });
+  } catch (error) {
+    console.error("Passkey authentication verification failed", error);
+    return reply({ error: "Passkey sign-in failed. Try again or use your PIN." }, 401);
+  }
+  if (!verification.verified) return reply({ error: "Passkey sign-in failed. Try again or use your PIN." }, 401);
+  await db(`passkeys?id=eq.${encodeURIComponent(stored.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ counter: verification.authenticationInfo.newCounter, last_used_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true, playerId: stored.player_id, token: signPlayerSession(stored.player_id) });
+}
+
+async function listPasskeys(body) {
+  const rows = await db(`passkeys?player_id=eq.${encodeURIComponent(body.playerId || "")}&select=id,friendly_name,device_type,backed_up,created_at,last_used_at&order=created_at.asc`);
+  return reply({ ok: true, passkeys: rows || [] });
+}
+
+async function renamePasskey(body) {
+  const name = String(body.friendlyName || "").trim();
+  if (!body.passkeyId || !name || name.length > 120) return reply({ error: "Enter a passkey name up to 120 characters." }, 400);
+  const rows = await db(`passkeys?id=eq.${encodeURIComponent(body.passkeyId)}&player_id=eq.${encodeURIComponent(body.playerId || "")}&select=id`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ friendly_name: name }) });
+  if (!rows?.length) return reply({ error: "Passkey not found." }, 404);
+  return reply({ ok: true });
+}
+
+async function deletePasskey(body) {
+  if (!body.passkeyId) return reply({ error: "Choose a passkey." }, 400);
+  const rows = await db(`passkeys?id=eq.${encodeURIComponent(body.passkeyId)}&player_id=eq.${encodeURIComponent(body.playerId || "")}&select=id`);
+  if (!rows?.length) return reply({ error: "Passkey not found." }, 404);
+  await db(`passkeys?id=eq.${encodeURIComponent(body.passkeyId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  return reply({ ok: true });
 }
 
 function normalisePushPreferences(preferences = {}) {
@@ -1346,6 +1525,9 @@ async function resetPlayerPin(body) {
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ pin_hash: null, pin_updated_at: new Date().toISOString(), pin_failed_attempts: 0, pin_locked_at: null }),
   });
+  // Resetting a PIN is an identity recovery action; revoke existing passkeys
+  // so the player can re-enrol only after setting the new PIN.
+  await db(`passkeys?player_id=eq.${encodeURIComponent(body.playerId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } }).catch(() => {});
   return reply({ ok: true });
 }
 
@@ -1827,12 +2009,14 @@ export default async (req) => {
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
+    if (req.method === "POST" && action === "passkey-auth-options") return passkeyAuthenticationOptions(req);
+    if (req.method === "POST" && action === "passkey-auth-verify") return passkeyAuthenticationVerify(req, body);
     if (req.method === "POST" && action === "guest-invite-info") return guestInviteInfo(body);
     if (req.method === "POST" && action === "guest-rsvp") return guestRsvp(body);
 
     if (req.method === "GET" && action === "push-public-key") return reply({ configured: pushConfigured(), publicKey: VAPID_PUBLIC_KEY || null });
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -1860,6 +2044,11 @@ export default async (req) => {
     if (req.method === "POST" && action === "push-unsubscribe") return disablePushSubscription(body);
     if (req.method === "POST" && action === "player-avatar-upload-url") return createPlayerAvatarUpload(body);
     if (req.method === "POST" && action === "player-update-profile") return runAudited(req, action, body, () => updatePlayerProfile(body));
+    if (req.method === "POST" && action === "passkey-register-options") return passkeyRegistrationOptions(req, body);
+    if (req.method === "POST" && action === "passkey-register-verify") return passkeyRegistrationVerify(req, body);
+    if (req.method === "POST" && action === "passkey-list") return listPasskeys(body);
+    if (req.method === "POST" && action === "passkey-rename") return renamePasskey(body);
+    if (req.method === "POST" && action === "passkey-delete") return deletePasskey(body);
     if (req.method === "POST" && action === "notification-read") return markNotificationRead(body);
     if (req.method === "POST" && action === "notification-read-all") return markNotificationRead(body, true);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
