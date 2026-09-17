@@ -680,6 +680,26 @@
         $('editProfileLogin').onclick=()=>finish('edit');
       });
     };
+    // Allow each player to dismiss the biometric onboarding prompt on this
+    // device. The Login & security settings remain available afterwards.
+    showPasskeySetupPrompt=function(){
+      const key=`bpt-passkey-onboarding-dismissed:${currentPlayerId}`;
+      if(!currentPlayerId||!playerToken||!window.PublicKeyCredential||!navigator.credentials||localStorage.getItem(key)==='true')return Promise.resolve();
+      return new Promise(async resolve=>{
+        let result;
+        try{result=await request('passkey-list','POST',{playerId:currentPlayerId})}catch{resolve();return}
+        if((result.passkeys||[]).length){resolve();return}
+        const finish=()=>{$('modal').classList.add('hidden');resolve()};
+        const renderSetup=()=>{
+          $('modalContent').innerHTML='<p class="eyebrow">ACCOUNT SECURITY</p><h2>Set up Face ID or Touch ID</h2><p class="sub">Use your device biometrics for quicker, secure sign-in next time. Your PIN remains available as a backup.</p><div class="note" style="margin-top:16px"><strong>One required step first.</strong><br>Install Banglas Playing Tennis on your Home Screen before setting up Face ID or Touch ID.</div><label class="toggle-row" style="justify-content:flex-start;margin-top:16px"><input id="hidePasskeyOnboarding" type="checkbox"><strong>Do not show again</strong></label><div class="actions" style="justify-content:flex-end;gap:8px"><button id="skipPasskeySetup" class="secondary">Not now</button><button id="startPasskeySetup" class="primary">Set up Face ID / Touch ID</button></div>';
+          $('modal').classList.remove('hidden');
+          $('skipPasskeySetup').onclick=()=>{if($('hidePasskeyOnboarding').checked)localStorage.setItem(key,'true');finish()};
+          $('startPasskeySetup').onclick=()=>{if(!isStandaloneApp()){renderShortcutGate();return}$('modal').classList.add('hidden');registerPasskey(false).finally(resolve)};
+        };
+        const renderShortcutGate=()=>{$('modalContent').innerHTML='<p class="eyebrow">STEP 1 · INSTALL THE APP</p><h2>Add it to your Home Screen first</h2><p class="sub">Face ID and Touch ID setup is only available after opening the app from its Home Screen shortcut.</p><div class="note" style="margin-top:16px">'+(isIosDevice()?'<strong>On iPhone or iPad:</strong> tap Share, then Add to Home Screen.':'<strong>On Android:</strong> use your browser menu and choose Add to Home screen or Install app.')+'</div><div class="actions" style="justify-content:flex-end;gap:8px"><button id="cancelPasskeySetup" class="secondary">Not now</button><button id="checkHomeScreen" class="primary">I’ve added it — continue</button></div>';$('modal').classList.remove('hidden');$('cancelPasskeySetup').onclick=finish;$('checkHomeScreen').onclick=()=>{if(!isStandaloneApp())return notify('Open the app from the new Home Screen shortcut, then sign in again to set up Face ID.');renderSetup()}};
+        renderSetup();
+      });
+    };
     // Remember only the last selected profile on this device. Authentication is
     // still required; no PIN, passkey, or session credential is stored here.
     const baseRenderPlayerChooser=renderPlayerChooser;
