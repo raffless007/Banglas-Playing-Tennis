@@ -1854,7 +1854,7 @@ async function updatePlayer(body) {
 
 async function updateGuest(body) {
   if (!body.playerId) return reply({ error: "Choose a guest." }, 400);
-  const guestRows = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,is_guest`);
+  const guestRows = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&is_guest=eq.true&select=id,name,is_guest,guest_of_player_id`);
   if (!guestRows?.length) return reply({ error: "That player is not in the guest archive." }, 404);
   const update = {};
   if (typeof body.name === "string" && body.name.trim()) {
@@ -1874,10 +1874,25 @@ async function updateGuest(body) {
     update.guest_of_player_id = guestOf.id;
   }
   if (!Object.keys(update).length) return reply({ error: "Nothing to update." }, 400);
-  await db(`players?id=eq.${encodeURIComponent(body.playerId)}`, {
-    method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
+  const updatedRows = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,is_guest,guest_event_id,guest_of_player_id`, {
+    method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(update),
   });
-  return reply({ ok: true });
+  const updated = updatedRows?.[0] || { ...guestRows[0], ...update };
+  // Keep the reusable archive's historical snapshots aligned with the guest
+  // record after a rename or Guest-of change. Older deployments may not have
+  // the archive table yet, so this must never block the player update.
+  const historyUpdate = {};
+  if (Object.prototype.hasOwnProperty.call(update, "name")) historyUpdate.guest_name = update.name;
+  if (Object.prototype.hasOwnProperty.call(update, "guest_of_player_id")) {
+    historyUpdate.guest_of_player_id = update.guest_of_player_id;
+    historyUpdate.guest_of_name = guestOf?.name || null;
+  }
+  if (Object.keys(historyUpdate).length) {
+    await db(`guest_history?guest_player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(historyUpdate),
+    }).catch(() => {});
+  }
+  return reply({ ok: true, player: updated });
 }
 
 async function promoteGuest(body) {
