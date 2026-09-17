@@ -667,6 +667,19 @@
       document.addEventListener('click',event=>{const avatar=event.target?.closest?.('[data-avatar-preview]');if(!avatar)return;event.preventDefault();event.stopPropagation();open(avatar)},true);
       document.addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ')&&document.activeElement?.matches?.('[data-avatar-preview]')){event.preventDefault();event.stopPropagation();open(document.activeElement)}},true);
     })();
+    // Let players permanently dismiss the optional profile-completion prompt on
+    // this device, scoped to their selected profile.
+    showProfileOnboarding=function(){
+      const key=`bpt-profile-onboarding-dismissed:${currentPlayerId}`;
+      if(localStorage.getItem(key)==='true')return Promise.resolve('skip');
+      return new Promise(resolve=>{
+        $('modalContent').innerHTML='<p class="eyebrow">STEP 4 · PLAYER PROFILE</p><h2>Complete your profile</h2><p class="sub">Add a display picture and your contact details so your profile is easy to recognise and payment reminders can reach you.</p><div class="note" style="margin-top:16px"><strong>Display picture recommended.</strong><br>You can update your name, mobile, email, address, and avatar at any time.</div><label class="toggle-row" style="justify-content:flex-start;margin-top:16px"><input id="hideProfileOnboarding" type="checkbox"><strong>Do not show again</strong></label><div class="actions" style="justify-content:flex-end;gap:8px"><button id="skipProfileLogin" class="secondary">Not now</button><button id="editProfileLogin" class="primary">Update my profile</button></div>';
+        $('modal').classList.remove('hidden');
+        const finish=result=>{if($('hideProfileOnboarding')?.checked)localStorage.setItem(key,'true');$('modal').classList.add('hidden');resolve(result)};
+        $('skipProfileLogin').onclick=()=>finish('skip');
+        $('editProfileLogin').onclick=()=>finish('edit');
+      });
+    };
     // Remember only the last selected profile on this device. Authentication is
     // still required; no PIN, passkey, or session credential is stored here.
     const baseRenderPlayerChooser=renderPlayerChooser;
