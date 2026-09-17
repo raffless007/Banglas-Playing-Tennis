@@ -352,7 +352,7 @@ async function savePasscode(passcode) {
 async function appState(req) {
   await ensureUpcomingEvents();
   const [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
-    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path&order=name.asc"),
+    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
     db("events?select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
     db("payments?select=event_id,player_id,amount,paid,paid_at"),
@@ -371,6 +371,7 @@ async function appState(req) {
     is_guest: player.is_guest,
     guest_event_id: player.guest_event_id,
     guest_of_player_id: player.guest_of_player_id,
+    pin_configured: Boolean(player.pin_hash),
     email: player.email || "",
     mobile: player.mobile || "",
     avatar_url: player.avatar_path ? await mediaUrl(player.avatar_path) : null,
