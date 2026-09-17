@@ -168,9 +168,11 @@
   <script>
     const API='/.netlify/functions/api',MEDIA_UPLOAD_LIMIT_BYTES=50*1024*1024;
     let deferredInstallPrompt=null,loginPromptRun=false,mediaTab='gallery';
-    const launchParams=new URLSearchParams(location.search);
-    let data={players:[],events:[],eois:[],payments:[],scores:[],liveMatches:[],notes:[],media:[],badges:[]},adminPlayers=[],adminGuestHistory=[],adminBadges=[],selected=0,paymentEventId=null,scoreEventId=null,scoreSubtab='scores',scoreDraftEventId=null,scoreDrafts=[],adminEventId=null,adminEoiEventId=null,adminPaymentEventId=null,adminScoreEventId=null,currentPlayerId=localStorage.getItem('bpt-player-id'),playerToken=localStorage.getItem('bpt-player-token'),adminToken=sessionStorage.getItem('bpt-admin-token'),adminDirty=false,adminBusy=false,livePointQueues=new Map(),livePointPending=new Map(),liveTimerInterval=null,weatherCache=new Map(),weatherPending=new Set(),weatherLoadSerial=0,launchPage=launchParams.get('page'),launchEventId=launchParams.get('event'),guestEventId=launchParams.get('guest'),guestInviteToken=launchParams.get('invite'),guestPromptShown=false,profilePagePlayerId=currentPlayerId;
+    const launchParams=new URLSearchParams(location.search),PLAYER_ID_KEY='bpt-player-id',LAST_PLAYER_KEY='bpt-last-player-id';
+    let data={players:[],events:[],eois:[],payments:[],scores:[],liveMatches:[],notes:[],media:[],badges:[]},adminPlayers=[],adminGuestHistory=[],adminBadges=[],selected=0,paymentEventId=null,scoreEventId=null,scoreSubtab='scores',scoreDraftEventId=null,scoreDrafts=[],adminEventId=null,adminEoiEventId=null,adminPaymentEventId=null,adminScoreEventId=null,currentPlayerId=localStorage.getItem(PLAYER_ID_KEY),playerToken=localStorage.getItem('bpt-player-token'),adminToken=sessionStorage.getItem('bpt-admin-token'),adminDirty=false,adminBusy=false,livePointQueues=new Map(),livePointPending=new Map(),liveTimerInterval=null,weatherCache=new Map(),weatherPending=new Set(),weatherLoadSerial=0,launchPage=launchParams.get('page'),launchEventId=launchParams.get('event'),guestEventId=launchParams.get('guest'),guestInviteToken=launchParams.get('invite'),guestPromptShown=false,profilePagePlayerId=currentPlayerId;
     const $=id=>document.getElementById(id), money=n=>'$'+Number(n).toFixed(2), initials=n=>String(n||'').trim().split(/\s+/).filter(Boolean).map(x=>x[0]).slice(0,2).join('').toUpperCase(),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    function rememberPlayer(playerId){if(playerId)localStorage.setItem(LAST_PLAYER_KEY,playerId)}
+    function forgetRememberedPlayer(){localStorage.removeItem(LAST_PLAYER_KEY);localStorage.removeItem(PLAYER_ID_KEY);localStorage.removeItem('bpt-player-token');localStorage.removeItem(PLAYER_ACTIVITY_KEY);currentPlayerId=null;playerToken=null;loginPromptRun=false}
     function uniqueInitialMap(){const used=new Set(),map=new Map(),players=[...data.players].filter(p=>p?.id&&p.name).sort((a,b)=>a.name.localeCompare(b.name)||a.id.localeCompare(b.id));for(const p of players){const words=String(p.name).trim().split(/\s+/).filter(Boolean),first=words[0]||'P',last=words[words.length-1]||first,candidates=[initials(p.name),words.length>1?(first[0]+last[0]).toUpperCase():'',first.slice(0,2).toUpperCase(),(first[0]||'P').toUpperCase()+(last.slice(-1)||'').toUpperCase()];let value=candidates.find(candidate=>candidate&&!used.has(candidate));if(!value){let n=2;do{value=`${(first[0]||'P').toUpperCase()}${n++}`}while(used.has(value))}used.add(value);map.set(p.id,value)}return map}
     function playerInitials(p){return uniqueInitialMap().get(p?.id)||initials(p?.name||'Player')}
     function avatarMarkup(p,className='avatar',id=''){if(!p)return`<span${id?` id="${id}"`:''} class="${className}">?</span>`;const attr=id?` id="${id}"`:'';if(p.avatar_url)return`<span${attr} class="${className} avatar-photo avatar-clickable" data-avatar-preview="${esc(p.avatar_url)}" data-avatar-name="${esc(p.name||'Player')}" role="button" tabindex="0" title="View display picture"><img src="${esc(p.avatar_url)}" alt="${esc(p.name||'Player')} display picture" loading="lazy"></span>`;return`<span${attr} class="${className}">${esc(playerInitials(p))}</span>`}
@@ -665,6 +667,31 @@
       document.addEventListener('click',event=>{const avatar=event.target?.closest?.('[data-avatar-preview]');if(!avatar)return;event.preventDefault();event.stopPropagation();open(avatar)},true);
       document.addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ')&&document.activeElement?.matches?.('[data-avatar-preview]')){event.preventDefault();event.stopPropagation();open(document.activeElement)}},true);
     })();
+    // Remember only the last selected profile on this device. Authentication is
+    // still required; no PIN, passkey, or session credential is stored here.
+    const baseRenderPlayerChooser=renderPlayerChooser;
+    renderPlayerChooser=function(){
+      let rememberedId=localStorage.getItem(LAST_PLAYER_KEY)||localStorage.getItem(PLAYER_ID_KEY);
+      if(rememberedId&&!activePlayers().some(p=>p.id===rememberedId)){localStorage.removeItem(LAST_PLAYER_KEY);rememberedId=null}
+      const previous=currentPlayerId;
+      if(!currentPlayerId&&rememberedId)currentPlayerId=rememberedId;
+      baseRenderPlayerChooser();
+      if(!previous)currentPlayerId=null;
+      const select=$('playerSelect');
+      if(select){select.onchange=()=>{currentPlayerId=select.value;rememberPlayer(currentPlayerId)};if(rememberedId&&select.value===rememberedId){select.insertAdjacentHTML('afterend','<p class="remembered-player-note">Last selected on this device · PIN or passkey still required.</p><button id="forgetRememberedPlayer" class="textbtn forget-player" type="button">Forget remembered player</button>');$('forgetRememberedPlayer').onclick=()=>{forgetRememberedPlayer();renderPlayerChooser();$('gate').classList.remove('hidden');notify('Remembered player cleared on this device')}}}
+    };
+    const baseOpenPlayerPin=openPlayerPin;
+    openPlayerPin=function(){const playerId=$('playerSelect')?.value;if(playerId)rememberPlayer(playerId);return baseOpenPlayerPin()};
+    const baseCompletePlayerLogin=completePlayerLogin;
+    completePlayerLogin=function(playerId,pinConfigured){rememberPlayer(playerId);return baseCompletePlayerLogin(playerId,pinConfigured)};
+    const basePasskeyLogin=passkeyLogin;
+    passkeyLogin=async function(){const result=await basePasskeyLogin();if(currentPlayerId)rememberPlayer(currentPlayerId);return result};
+    const baseSwitchPlayerLogin=switchPlayerLogin;
+    switchPlayerLogin=function(){if(currentPlayerId)rememberPlayer(currentPlayerId);return baseSwitchPlayerLogin()};
   </script>
+  <style>
+    .remembered-player-note{color:var(--muted);font-size:10px;margin:8px 0 0;text-align:center}
+    .forget-player{font-size:10px;text-align:center;margin-top:8px}
+  </style>
 </body>
 </html>
