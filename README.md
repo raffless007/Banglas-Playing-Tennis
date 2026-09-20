@@ -107,6 +107,16 @@ production deployment.
 - After the session, only players marked **In** can confirm payment.
 - Each player pays `total active court fees ÷ In players + ball fee`.
 - The Media tab accepts images and videos up to 50 MB after automatic, quality-preserving compression when needed.
+
+## Reliability and operations
+
+Run `npm run check` before pushing changes. This validates the Netlify functions and the production safety checks in `test/config.test.mjs`.
+
+The Netlify health endpoint is available at `/.netlify/functions/health`. It reports only whether required service configuration is present; it never returns secrets.
+
+Player sessions are tracked server-side. A session that has been idle for 15 minutes is revoked automatically, and the Login & security settings screen includes a “Log out of all devices” action.
+
+The application uses a 5 GB application-level media quota and a 50 MB final per-file limit. Supabase Storage billing and provider limits remain separate from this application quota.
 - Media is sorted by date, displayed as gallery tiles and available for download.
 - Admin can permanently remove an incorrect media upload.
 - Weekly scores are visible to everyone, but only players marked **In** can add them.

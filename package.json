@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "netlify dev"
+    "dev": "netlify dev",
+    "check": "npm run check:js && npm run check:config",
+    "check:js": "node --check netlify/functions/api.mjs && node --check netlify/functions/push.mjs && node --check netlify/functions/reminders.mjs && node --check netlify/functions/health.mjs && node --check public/sw.js && node --check public/js/experience-utils.js && node --check public/js/a11y-enhancements.js",
+    "check:config": "node --test test/config.test.mjs"
   },
   "dependencies": {
     "@simplewebauthn/server": "14.0.2",

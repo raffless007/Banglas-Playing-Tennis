@@ -27,6 +27,7 @@ const MEDIA_TOTAL_BYTES = 5 * 1024 * 1024 * 1024;
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
+const PLAYER_SERVER_IDLE_MS = 15 * 60 * 1000;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 // Optional publishable key used only by the browser for low-latency sync. The
 // service-role key is never returned to clients.
@@ -37,6 +38,7 @@ const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
 const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || "Banglas Playing Tennis";
 const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || "";
 const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean);
+const rateBuckets = new Map();
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -46,6 +48,20 @@ function requireConfiguration() {
   if (!SUPABASE_URL || !SERVICE_KEY || !SESSION_SECRET) {
     throw new Error("Server environment variables are not configured.");
   }
+}
+
+function consumeRateLimit(req, bucket, limit = 20, windowMs = 60_000) {
+  const forwarded = req.headers.get("x-forwarded-for") || req.headers.get("x-nf-client-connection-ip") || "unknown";
+  const key = `${bucket}:${forwarded.split(",")[0].trim()}`;
+  const now = Date.now();
+  const recent = (rateBuckets.get(key) || []).filter(timestamp => now - timestamp < windowMs);
+  if (recent.length >= limit) return false;
+  recent.push(now);
+  rateBuckets.set(key, recent);
+  if (rateBuckets.size > 5000) {
+    for (const [storedKey, timestamps] of rateBuckets) if (!timestamps.some(timestamp => now - timestamp < windowMs)) rateBuckets.delete(storedKey);
+  }
+  return true;
 }
 
 function storageClient() {
@@ -345,14 +361,29 @@ async function isPlayer(req, playerId) {
     const session = JSON.parse(Buffer.from(payload, "base64url").toString());
     if (session.type !== "player" || session.sub !== playerId || session.exp <= Date.now()) return false;
     if (session.sid) {
-      const active = await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}&player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null&select=session_id`);
+      const active = await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}&player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null&select=session_id,last_seen_at`);
       if (!active?.length) return false;
+      const lastSeen = Date.parse(active[0].last_seen_at || "");
+      if (Number.isFinite(lastSeen) && Date.now() - lastSeen > PLAYER_SERVER_IDLE_MS) {
+        await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
+        return false;
+      }
       await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
     }
     const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=pin_updated_at`);
     const pinUpdatedAt = Date.parse(rows?.[0]?.pin_updated_at || "");
     return !!rows?.length && (!Number.isFinite(pinUpdatedAt) || pinUpdatedAt <= Number(session.iat || 0));
   } catch { return false; }
+}
+
+async function revokePlayerSessions(body) {
+  if (!body.playerId) return reply({ error: "Choose a player profile first." }, 400);
+  await db(`player_sessions?player_id=eq.${encodeURIComponent(body.playerId)}&revoked_at=is.null`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ revoked_at: new Date().toISOString() }),
+  });
+  return reply({ ok: true });
 }
 
 async function getEvent(eventId) {
@@ -396,6 +427,7 @@ async function appState(req) {
     db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
   const admin = isAdmin(req);
+  const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
   const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
   const players = await Promise.all((playerRows || []).map(async player => ({
@@ -426,7 +458,7 @@ async function appState(req) {
     await createPlayerNotifications(pending).catch(() => {});
   }
   const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
-  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, sessionPlayerId: playerId, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function mediaState(req) {
@@ -2100,6 +2132,10 @@ export default async (req) => {
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
+    if (req.method === "POST" && ["player-login", "admin-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
+      return reply({ error: "Too many sign-in attempts. Please wait a minute and try again." }, 429, { "retry-after": "60" });
+    }
+
     if (req.method === "GET" && action === "state") return reply(await appState(req));
     if (req.method === "GET" && action === "media-state") return mediaState(req);
     if (req.method === "GET" && action === "live-state") return liveState();
@@ -2116,7 +2152,7 @@ export default async (req) => {
     if (req.method === "GET" && action === "realtime-config") return reply({ configured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY), url: SUPABASE_URL || null, anonKey: SUPABASE_ANON_KEY || null });
     if (req.method === "GET" && action === "sync-version") return syncVersion();
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -2149,6 +2185,7 @@ export default async (req) => {
     if (req.method === "POST" && action === "passkey-list") return listPasskeys(body);
     if (req.method === "POST" && action === "passkey-rename") return renamePasskey(body);
     if (req.method === "POST" && action === "passkey-delete") return deletePasskey(body);
+    if (req.method === "POST" && action === "player-logout-all") return revokePlayerSessions(body);
     if (req.method === "POST" && action === "notification-read") return markNotificationRead(body);
     if (req.method === "POST" && action === "notification-read-all") return markNotificationRead(body, true);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
