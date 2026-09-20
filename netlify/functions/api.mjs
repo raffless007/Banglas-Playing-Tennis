@@ -253,22 +253,22 @@ async function ensureUpcomingEvents() {
   upcomingEnsurePromise = (async () => {
     const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
     const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
-    if (events.length) {
-      await db("events?on_conflict=event_date", {
+    const now = datePartsInSydney();
+    const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
+    const maintenance = [];
+    if (events.length) maintenance.push(db("events?on_conflict=event_date", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify(events),
-      });
-    }
-    const now = datePartsInSydney();
-    const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
+      }));
     // Migrate only legacy upcoming rows that still carry the old default. An
     // explicitly edited fee is never overwritten because this targets 52 only.
-    await db(`events?event_date=gte.${today}&court_fee=eq.52`, {
+    maintenance.push(db(`events?event_date=gte.${today}&court_fee=eq.52`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ court_fee: 54, updated_at: new Date().toISOString() }),
-    });
+    }));
+    await Promise.all(maintenance);
     upcomingEnsuredAt = Date.now();
   })().finally(() => { upcomingEnsurePromise = null; });
   return upcomingEnsurePromise;
@@ -485,18 +485,12 @@ async function eoiState() {
 }
 
 async function adminState() {
-  const [players, subscriptions, badges] = await Promise.all([
+  const [players, subscriptions, badges, guestHistory] = await Promise.all([
     db("players?select=id,name,active,email,is_guest,guest_event_id,guest_of_player_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=id,player_id,endpoint,active,updated_at,created_at&active=eq.true"),
     db("badges?select=*&order=sort_order.asc,name.asc").catch(() => []),
+    db("guest_history?select=*&order=assigned_at.desc").catch(() => []),
   ]);
-  let guestHistory = [];
-  try {
-    guestHistory = await db("guest_history?select=*&order=assigned_at.desc");
-  } catch {
-    // The archive migration may still be waiting to be applied. Keep the
-    // existing roster controls usable until it is run.
-  }
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
   const pushDevices = (subscriptions || []).reduce((map, subscription) => {
     const list = map.get(subscription.player_id) || [];
