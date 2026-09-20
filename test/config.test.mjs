@@ -22,3 +22,13 @@ test("high-risk production constants are not accidentally reduced", () => {
   assert.match(api, /MEDIA_TOTAL_BYTES\s*=\s*5\s*\*\s*1024\s*\*\s*1024\s*\*\s*1024/);
   assert.match(api, /SCORING_WINDOW_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
 });
+
+test("the inline app script remains valid JavaScript", () => {
+  const inlineScripts = [...index.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
+    .map((match) => match[1])
+    .filter((source) => source.trim());
+  assert.ok(inlineScripts.length, "Expected an inline app script.");
+  for (const source of inlineScripts) {
+    assert.doesNotThrow(() => new Function(source));
+  }
+});
