@@ -1,4 +1,6 @@
-const SHELL_CACHE = "bpt-shell-v2";
+// Bump the shell when the runtime changes so devices discard the failed
+// release instead of reusing its HTML or helper assets.
+const SHELL_CACHE = "bpt-shell-v3";
 const SHELL_ASSETS = ["/", "/manifest.webmanifest", "/js/experience-utils.js", "/js/a11y-enhancements.js", "/assets/tennis-app-icon.png"];
 
 self.addEventListener("install", event => {

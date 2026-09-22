@@ -1,5 +1,13 @@
 # Changelog
 
+## 23 September 2026 — compatibility reapplication prepared locally
+
+- Reimplemented the failed reliability pass on top of the known-good runtime rather than restoring its incompatible startup/UI changes wholesale.
+- Added loader recovery, legacy-admin-token compatibility, optional admin session tracking, idempotent live-point retries, per-player offline queues and five-minute background version polling.
+- Preserved historical payment amounts and corrected weekly recap player totals.
+- Bumped the service-worker shell cache and added checks for the new compatibility paths.
+- Local only; no Netlify deployment was performed.
+
 ## 23 September 2026 — rollback to known-good runtime
 
 - Rolled the application runtime back to `d4b9ac6` after the later reliability release caused an app-loading regression.

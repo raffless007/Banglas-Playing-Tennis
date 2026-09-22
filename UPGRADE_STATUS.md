@@ -4,7 +4,7 @@ Last reviewed: 23 September 2026 (Australia/Sydney)
 
 ## Current phase
 
-Phase 1 complete; Phase 2–7 are being delivered incrementally. The runtime has been rolled back to the known-good build `d4b9ac6` after the later reliability pass caused an app-loading regression. Notification-specific improvements remain enabled, and migrations 036–037 remain applied to the production Supabase project.
+Phase 1 complete; Phase 2–7 are being delivered incrementally. The runtime is based on the known-good rollback build `d6a72ce`; the reliability work has been reimplemented with backwards-compatible fallbacks and is prepared locally for review. Notification-specific improvements remain enabled, and migrations 036–037 remain applied to the production Supabase project.
 
 ## Rollback note — 23 September 2026
 
@@ -31,6 +31,16 @@ Phase 1 complete; Phase 2–7 are being delivered incrementally. The runtime has
 - Hardened the service worker to ignore malformed push payloads safely and to route valid notification clicks to the requested in-app page.
 - Applied migrations `036_reliability_security.sql` and `037_specific_notification_copy.sql` to production and verified every expected table, column and schedule update.
 - Added automated coverage for notification specificity and deferred email behaviour.
+
+## Compatibility reapplication — local only
+
+- Made the startup loader fail open to the sign-in screen instead of covering the app when state loading or rendering fails.
+- Kept legacy signed admin tokens valid while enabling tracked 10-minute admin idle sessions when `admin_sessions` is available.
+- Added optional live scorer leases and idempotent point action IDs with retries that fall back cleanly on older schemas.
+- Namespaced offline live-score queues per player and reduced background sync-version polling to every five minutes; resume still checks immediately.
+- Preserved historical payment amounts when an existing payment is re-confirmed and fixed weekly recap player totals.
+- Bumped the service-worker shell cache so clients discard the failed shell safely.
+- Ran the JavaScript/configuration suite successfully (7 tests passing). This compatibility pass has not been deployed to Netlify.
 
 ## Existing protections verified during the audit
 
