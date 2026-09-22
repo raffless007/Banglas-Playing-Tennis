@@ -40,6 +40,7 @@ const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || "Banglas Playing Tennis
 const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || "";
 const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean);
 const rateBuckets = new Map();
+const signedMediaUrlCache = new Map();
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -193,8 +194,18 @@ function scoringWindowError(event) {
 }
 
 async function mediaUrl(path) {
+  const cached = signedMediaUrlCache.get(path);
+  if (cached && cached.expiresAt > Date.now()) return cached.url;
   const { data, error } = await storageClient().storage.from(MEDIA_BUCKET).createSignedUrl(path, 3600);
   if (error || !data?.signedUrl) return null;
+  // Avatars are included in the main state response for every signed-in user.
+  // Reuse each signed URL for most of its lifetime instead of making one
+  // Storage request per avatar on every state refresh.
+  signedMediaUrlCache.set(path, { url: data.signedUrl, expiresAt: Date.now() + 50 * 60 * 1000 });
+  if (signedMediaUrlCache.size > 200) {
+    const oldest = signedMediaUrlCache.keys().next().value;
+    if (oldest) signedMediaUrlCache.delete(oldest);
+  }
   return data.signedUrl;
 }
 
@@ -289,7 +300,10 @@ let upcomingEnsuredAt = 0;
 let upcomingEnsurePromise = null;
 async function ensureUpcomingEvents() {
   if (upcomingEnsurePromise) return upcomingEnsurePromise;
-  if (Date.now() - upcomingEnsuredAt < 60_000) return;
+  // This is maintenance work, not per-request data. Keeping the warm-instance
+  // cache at five minutes avoids repeating three database calls during bursts
+  // of logins and refreshes while still healing newly-created weekly events.
+  if (Date.now() - upcomingEnsuredAt < 5 * 60_000) return;
   upcomingEnsurePromise = (async () => {
     const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
     const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
