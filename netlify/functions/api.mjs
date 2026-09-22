@@ -508,8 +508,14 @@ async function savePasscode(passcode) {
 }
 
 async function appState(req) {
-  await ensureUpcomingEvents();
-  const [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
+  // Keep weekly-event maintenance off the critical path. Existing events are
+  // already enough to render the clubhouse; only wait and re-read if the
+  // response genuinely has no current upcoming Wednesday to show.
+  const ensurePromise = ensureUpcomingEvents().catch(error => {
+    console.error("Upcoming event maintenance failed", error?.message || error);
+    return null;
+  });
+  let [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
     listVisibleEvents(),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
@@ -519,6 +525,11 @@ async function appState(req) {
     db("event_notes?select=*"),
     db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
+  const expectedUpcoming = new Set(upcomingWednesdays());
+  if (!(events || []).some(event => expectedUpcoming.has(event.event_date))) {
+    await ensurePromise;
+    events = await listVisibleEvents();
+  }
   const admin = await isAdminSession(req);
   const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
