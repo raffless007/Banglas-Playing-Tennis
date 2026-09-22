@@ -12,6 +12,7 @@
 - Made malformed push payloads no-ops and kept notification clicks routed to their requested app page.
 - Preserved historical payment amounts when an existing payment is re-confirmed after an event fee edit.
 - Updated the canonical Supabase schema with the reliability tables/columns and contextual notification defaults used by the new migrations.
+- Applied migrations `036_reliability_security.sql` and `037_specific_notification_copy.sql` to the production Supabase project and verified the resulting schema and alert schedules.
 - Added tests covering notification context and deferred email behaviour.
 
 ## Earlier local work retained

@@ -4,7 +4,7 @@ Last reviewed: 23 September 2026 (Australia/Sydney)
 
 ## Current phase
 
-Phase 1 complete; Phase 2–7 are being delivered incrementally. This package is release-ready for the reviewed Netlify workflow. The Supabase production database has not been changed by this upgrade pass; migrations remain explicit release steps.
+Phase 1 complete; Phase 2–7 are being delivered incrementally. The reviewed Netlify release is live, and migrations 036–037 have now been applied to the production Supabase project and verified.
 
 ## Completed in this pass
 
@@ -22,6 +22,7 @@ Phase 1 complete; Phase 2–7 are being delivered incrementally. This package is
 - Preserved an existing event/player payment amount when a payment is re-confirmed, so historical charges do not change after later event-fee edits.
 - Kept the canonical `supabase/schema.sql` aligned with the new reliability tables, scorer lease fields, notification grouping and specific payment-alert defaults.
 - Hardened the service worker to ignore malformed push payloads safely and to route valid notification clicks to the requested in-app page.
+- Applied migrations `036_reliability_security.sql` and `037_specific_notification_copy.sql` to production and verified every expected table, column and schedule update.
 - Added automated coverage for notification specificity and deferred email behaviour.
 
 ## Existing protections verified during the audit
@@ -45,4 +46,4 @@ Phase 1 complete; Phase 2–7 are being delivered incrementally. This package is
 
 - Already-sent push alerts and historical inbox entries are intentionally not rewritten; audit history preserves the original copy.
 - A manually authored alert without a selected event has no session context to attach. Event-scoped manual alerts are contextualized automatically.
-- No staging Supabase project was available in this local workspace, so database migrations are prepared but not executed.
+- No staging Supabase project was available; production migrations were applied only after explicit approval through the verified Banglas Playing Tennis production project.
