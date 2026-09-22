@@ -4,7 +4,14 @@ Last reviewed: 23 September 2026 (Australia/Sydney)
 
 ## Current phase
 
-Phase 1 complete; Phase 2–7 are being delivered incrementally. The reviewed Netlify release is live, and migrations 036–037 have now been applied to the production Supabase project and verified.
+Phase 1 complete; Phase 2–7 are being delivered incrementally. The runtime has been rolled back to the known-good build `d4b9ac6` after the later reliability pass caused an app-loading regression. Notification-specific improvements remain enabled, and migrations 036–037 remain applied to the production Supabase project.
+
+## Rollback note — 23 September 2026
+
+- Restored the app runtime/UI/server handlers to `d4b9ac6`.
+- Kept the specific notification copy, notification click routing, malformed-payload handling, contextual scheduled alerts and deferred-email guard.
+- Kept the already-applied Supabase migrations; no destructive database rollback was performed.
+- Reverted unrelated reliability, session, live-scoring, privacy and UI changes from the failed release.
 
 ## Completed in this pass
 

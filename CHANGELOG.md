@@ -1,5 +1,10 @@
 # Changelog
 
+## 23 September 2026 — rollback to known-good runtime
+
+- Rolled the application runtime back to `d4b9ac6` after the later reliability release caused an app-loading regression.
+- Retained the notification-specific changes and the already-applied Supabase migrations; no database rollback was performed.
+
 ## 23 September 2026 — notification and safety pass
 
 - Reworked automatic notification titles and bodies to identify the relevant session instead of using generic copy.

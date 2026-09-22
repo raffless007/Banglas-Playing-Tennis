@@ -17,7 +17,7 @@ import { activePlayerIds, notifyPlayers, pushConfigured } from "./push.mjs";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET;
-const INITIAL_PASSCODE = String(process.env.INITIAL_ADMIN_PASSCODE || "").trim();
+const INITIAL_PASSCODE = process.env.INITIAL_ADMIN_PASSCODE || "1234";
 const SYDNEY = "Australia/Sydney";
 const MEDIA_BUCKET = "tennis-media";
 const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
@@ -28,7 +28,6 @@ const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
 const PLAYER_SERVER_IDLE_MS = 15 * 60 * 1000;
-const ADMIN_SERVER_IDLE_MS = 10 * 60 * 1000;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 // Optional publishable key used only by the browser for low-latency sync. The
 // service-role key is never returned to clients.
@@ -93,7 +92,7 @@ async function createPlayerNotifications(rows) {
     method: "POST",
     headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
     body: JSON.stringify(valid.map(row => ({
-      player_id: row.player_id, event_id: row.event_id || null, notification_type: row.notification_type || "session", group_key: row.group_key || row.dedupe_key?.split(":").slice(0, 2).join(":") || null,
+      player_id: row.player_id, event_id: row.event_id || null, notification_type: row.notification_type || "session",
       title: String(row.title).slice(0, 120), body: String(row.body).slice(0, 500), url: row.url || "/?page=play", dedupe_key: row.dedupe_key,
     }))),
   });
@@ -187,7 +186,7 @@ async function mediaUrl(path) {
 }
 
 async function auditActor(req) {
-  if (await isAdminSession(req)) return { actor_type: "admin", actor_player_id: null, actor_name: ADMIN_DISPLAY_NAME };
+  if (isAdmin(req)) return { actor_type: "admin", actor_player_id: null, actor_name: ADMIN_DISPLAY_NAME };
   const playerId = playerSessionSubject(req);
   if (!playerId) return { actor_type: "anonymous", actor_player_id: null, actor_name: "Anonymous visitor" };
   let actorName = null;
@@ -281,12 +280,21 @@ async function ensureUpcomingEvents() {
   upcomingEnsurePromise = (async () => {
     const deletedDates = new Set((await db("deleted_event_dates?select=event_date")).map(row => row.event_date));
     const events = upcomingWednesdays().filter(event_date => !deletedDates.has(event_date)).map(event_date => ({ event_date }));
+    const now = datePartsInSydney();
+    const today = `${now.year}-${String(now.month).padStart(2, "0")}-${String(now.day).padStart(2, "0")}`;
     const maintenance = [];
     if (events.length) maintenance.push(db("events?on_conflict=event_date", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify(events),
       }));
+    // Migrate only legacy upcoming rows that still carry the old default. An
+    // explicitly edited fee is never overwritten because this targets 52 only.
+    maintenance.push(db(`events?event_date=gte.${today}&court_fee=eq.52`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ court_fee: 54, updated_at: new Date().toISOString() }),
+    }));
     await Promise.all(maintenance);
     upcomingEnsuredAt = Date.now();
   })().finally(() => { upcomingEnsurePromise = null; });
@@ -322,9 +330,8 @@ function verifyPasscode(passcode, stored) {
   return actual.length === expectedBuffer.length && timingSafeEqual(actual, expectedBuffer);
 }
 
-function signSession(sessionId) {
-  const now = Date.now();
-  const payload = Buffer.from(JSON.stringify({ type: "admin", sid: sessionId, iat: now, exp: now + 8 * 60 * 60 * 1000 })).toString("base64url");
+function signSession() {
+  const payload = Buffer.from(JSON.stringify({ exp: Date.now() + 8 * 60 * 60 * 1000 })).toString("base64url");
   const signature = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
@@ -361,40 +368,14 @@ function playerSessionSubject(req) {
   }
 }
 
-function adminTokenPayload(req) {
+function isAdmin(req) {
   const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const [payload, signature] = token.split(".");
-  if (!payload || !signature) return null;
+  if (!payload || !signature) return false;
   const expected = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
-  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
-  try {
-    const value = JSON.parse(Buffer.from(payload, "base64url").toString());
-    return value.type === "admin" && value.sid && value.exp > Date.now() ? value : null;
-  } catch { return null; }
-}
-
-function isAdmin(req) {
-  return Boolean(adminTokenPayload(req));
-}
-
-async function isAdminSession(req) {
-  const payload = adminTokenPayload(req);
-  if (!payload) return false;
-  try {
-    const rows = await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}&revoked_at=is.null&select=session_id,last_seen_at`);
-    const row = rows?.[0];
-    if (!row) return false;
-    const lastSeen = Date.parse(row.last_seen_at || "");
-    if (Number.isFinite(lastSeen) && Date.now() - lastSeen > ADMIN_SERVER_IDLE_MS) {
-      await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
-      return false;
-    }
-    await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
-    return true;
-  } catch {
-    // Keep existing installations usable until migration 036 is applied.
-    return true;
-  }
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false;
+  try { return JSON.parse(Buffer.from(payload, "base64url").toString()).exp > Date.now(); }
+  catch { return false; }
 }
 
 async function isPlayer(req, playerId) {
@@ -472,7 +453,7 @@ async function appState(req) {
     db("event_notes?select=*"),
     db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
   ]);
-  const admin = await isAdminSession(req);
+  const admin = isAdmin(req);
   const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
   const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
@@ -484,9 +465,9 @@ async function appState(req) {
     guest_event_id: player.guest_event_id,
     guest_of_player_id: player.guest_of_player_id,
     pin_configured: Boolean(player.pin_hash),
-    email: admin || player.id === playerId ? player.email || "" : "",
-    mobile: admin || player.id === playerId ? player.mobile || "" : "",
-    avatar_url: admin || player.id === playerId ? (player.avatar_path ? await mediaUrl(player.avatar_path) : null) : null,
+    email: player.email || "",
+    mobile: player.mobile || "",
+    avatar_url: player.avatar_path ? await mediaUrl(player.avatar_path) : null,
     ...(admin || player.id === playerId ? { address: player.address || "" } : {}),
   })));
   const visiblePayments = payments.map(payment => {
@@ -503,17 +484,14 @@ async function appState(req) {
     }
     await createPlayerNotifications(pending).catch(() => {});
   }
-  const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
-  const authenticated = admin || Boolean(playerId);
-  return { players, events: authenticated ? events : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
+  return { players, events, eois, payments: visiblePayments, scores, liveMatches, notes, badges, notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function mediaState(req) {
-  const admin = await isAdminSession(req);
-  const candidatePlayerId = admin ? null : playerSessionSubject(req);
-  const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
-  if (!admin && !playerId) return reply({ media: [], mediaUsage: 0, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() });
   const rows = await db("media_items?select=*&order=captured_at.desc,created_at.desc");
+  const candidatePlayerId = isAdmin(req) ? null : playerSessionSubject(req);
+  const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
   const favouriteRows = playerId
     ? await db(`media_favourites?player_id=eq.${encodeURIComponent(playerId)}&select=media_id`).catch(() => [])
     : [];
@@ -562,7 +540,7 @@ async function syncVersion() {
 }
 
 async function adminBackup(req) {
-  if (!await isAdminSession(req)) return reply({ error: "Admin session expired." }, 401);
+  if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
   const tables = {
     // Explicit projections prevent PIN hashes, invite tokens and other
     // authentication material from ever entering an exported backup.
@@ -931,12 +909,7 @@ async function markPaid(body) {
   if (new Date() < localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) return reply({ error: "Payments open after the game finishes." }, 409);
   const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
   if (!attending.some(row => row.player_id === body.playerId)) return reply({ error: "Only players marked In can confirm payment." }, 403);
-  // Preserve the amount already recorded for this event/player. Event fees can
-  // be edited later, but a historical charge must not silently change when a
-  // player re-confirms payment.
-  const existingPayment = (await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=amount,paid`))?.[0] || null;
-  const calculatedAmount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
-  const amount = Number.isFinite(Number(existingPayment?.amount)) ? Number(existingPayment.amount) : calculatedAmount;
+  const amount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
   await db("payments?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -1078,7 +1051,7 @@ async function startLiveMatch(body, adminOverride = false) {
     created = await db("live_matches?select=*", {
       method: "POST",
       headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), started_at: new Date().toISOString() }),
+      body: JSON.stringify({ event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, started_at: new Date().toISOString() }),
     });
   } catch (error) {
     if (/duplicate|unique/i.test(error?.message || "")) return reply({ error: "Finish or abandon the current live match first." }, 409);
@@ -1117,7 +1090,7 @@ async function updateLiveServer(body, adminOverride = false) {
   const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_order: serverOrder, server_index: serverIndex, needs_server_choice: false, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ server_player_id: body.serverPlayerId, server_order: serverOrder, server_index: serverIndex, needs_server_choice: false, version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() }),
   });
   if (!updated?.length) return reply({ error: "This match changed on another device. Refresh and try again." }, 409);
   return reply({ ok: true, match: updated?.[0] || { ...match, server_player_id: body.serverPlayerId, server_index: serverIndex, needs_server_choice: false } });
@@ -1133,22 +1106,6 @@ async function addLivePoint(body, adminOverride = false) {
   const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
-  const actionId = String(body.actionId || "").trim();
-  if (actionId) {
-    try {
-      const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&live_match_id=eq.${encodeURIComponent(match.id)}&select=result`);
-      if (prior?.[0]?.result) return reply(prior[0].result);
-      await db("live_point_actions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ action_id: actionId, live_match_id: match.id, winner: body.winner, status: "pending" }) });
-    } catch (error) {
-      if (/duplicate|unique/i.test(error?.message || "")) {
-        const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&select=result`);
-        if (prior?.[0]?.result) return reply(prior[0].result);
-        return reply({ error: "This point is already being synced. Refresh the match." }, 409);
-      }
-      // Older databases do not have the optional idempotency table yet.
-      if (!/live_point_actions|relation|column/i.test(error?.message || "")) throw error;
-    }
-  }
   const next = liveAdvance(match, body.winner);
   const history = [...liveHistory(match), liveSnapshot(match)].slice(-200);
   const gameFinished = !!next.game_finished;
@@ -1169,21 +1126,14 @@ async function addLivePoint(body, adminOverride = false) {
     point_history: history,
     version: Number(match.version || 0) + 1,
     updated_at: new Date().toISOString(),
-    active_scorer_id: body.playerId,
-    scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
   };
   const updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch),
   });
-  if (!updated?.length) {
-    if (actionId) await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}`, { method: "DELETE" }).catch(() => {});
-    return reply({ error: "This score changed on another device. Refresh and try again." }, 409);
-  }
-  const result = { ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id, match: updated?.[0] || { ...match, ...patch } };
-  if (actionId) await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "applied", result }) }).catch(() => {});
-  return reply(result);
+  if (!updated?.length) return reply({ error: "This score changed on another device. Refresh and try again." }, 409);
+  return reply({ ok: true, completed: next.completed, gameFinished, nextServerId: next.server_player_id, matchId: match.id, match: updated?.[0] || { ...match, ...patch } });
 }
 
 async function undoLivePoint(body, adminOverride = false) {
@@ -1371,15 +1321,12 @@ async function saveEventNote(body) {
 async function adminLogin(body) {
   if (!/^\d{4,8}$/.test(body.passcode || "")) return reply({ error: "Invalid passcode." }, 401);
   let stored = await getPasscodeSetting();
-  if (!stored && !/^\d{4,8}$/.test(INITIAL_PASSCODE)) return reply({ error: "Admin passcode is not configured. Set INITIAL_ADMIN_PASSCODE before first login." }, 503);
   if (!stored && body.passcode === INITIAL_PASSCODE) {
     await savePasscode(body.passcode);
     stored = await getPasscodeSetting();
   }
   if (!verifyPasscode(body.passcode, stored)) return reply({ error: "Incorrect passcode." }, 401);
-  const sessionId = randomUUID();
-  await db("admin_sessions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ session_id: sessionId, label: "Admin browser" }) }).catch(error => console.error("Admin session tracking unavailable", error?.message || error));
-  return reply({ ok: true, token: signSession(sessionId) });
+  return reply({ ok: true, token: signSession() });
 }
 
 async function changePasscode(body) {
@@ -1387,9 +1334,7 @@ async function changePasscode(body) {
   if (!verifyPasscode(body.currentPasscode || "", stored)) return reply({ error: "Current passcode is incorrect." }, 401);
   if (!/^\d{4,8}$/.test(body.newPasscode || "")) return reply({ error: "Use 4–8 numbers." }, 400);
   await savePasscode(body.newPasscode);
-  const sessionId = randomUUID();
-  await db("admin_sessions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ session_id: sessionId, label: "Admin browser" }) }).catch(error => console.error("Admin session tracking unavailable", error?.message || error));
-  return reply({ ok: true, token: signSession(sessionId) });
+  return reply({ ok: true, token: signSession() });
 }
 
 async function saveEvent(body) {
@@ -1787,9 +1732,7 @@ async function adminSetPayment(body) {
   if (!attending.some(row => row.player_id === body.playerId)) {
     return reply({ error: "Only players marked In can have a payment recorded." }, 409);
   }
-  const existingPayment = (await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=amount,paid`))?.[0] || null;
-  const calculatedAmount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
-  const amount = Number.isFinite(Number(existingPayment?.amount)) ? Number(existingPayment.amount) : calculatedAmount;
+  const amount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
   await db("payments?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -2226,13 +2169,9 @@ export default async (req) => {
     const url = new URL(req.url);
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
-    const adminSessionValid = await isAdminSession(req);
 
     if (req.method === "POST" && ["player-login", "admin-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
       return reply({ error: "Too many sign-in attempts. Please wait a minute and try again." }, 429, { "retry-after": "60" });
-    }
-    if (req.method === "POST" && ["player-pin-status", "player-create-pin"].includes(action) && !consumeRateLimit(req, `${action}:${body.playerId || "unknown"}`, 8, 15 * 60_000)) {
-      return reply({ error: "Too many PIN setup requests for this player. Please try again later." }, 429, { "retry-after": "900" });
     }
 
     if (req.method === "GET" && action === "state") return reply(await appState(req));
@@ -2255,19 +2194,19 @@ export default async (req) => {
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
-      if (!adminSessionValid && !(await isPlayer(req, playerId))) {
+      if (!isAdmin(req) && !(await isPlayer(req, playerId))) {
         return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
       }
     }
     if (req.method === "POST" && action === "eoi") return runAudited(req, action, body, () => submitEoi(body));
     if (req.method === "POST" && action === "paid") return runAudited(req, action, body, () => markPaid(body));
     if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body));
-    if (req.method === "POST" && action === "live-start") return startLiveMatch(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-server") return updateLiveServer(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-point") return addLivePoint(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-undo") return undoLivePoint(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body, adminSessionValid);
+    if (req.method === "POST" && action === "live-start") return startLiveMatch(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-server") return updateLiveServer(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-point") return addLivePoint(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-undo") return undoLivePoint(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body, isAdmin(req));
+    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body, isAdmin(req));
     if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
     if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
@@ -2289,27 +2228,27 @@ export default async (req) => {
     if (req.method === "POST" && action === "notification-read-all") return markNotificationRead(body, true);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
     if (req.method === "GET" && action === "admin-state") {
-      if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return reply(await adminState());
     }
     if (req.method === "GET" && action === "admin-backup") return adminBackup(req);
 
     if (req.method === "GET" && action === "admin-audit-log") {
-      if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAuditLog();
     }
     if (req.method === "GET" && action === "admin-alert-log") {
-      if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAlertLog();
     }
     if (req.method === "GET" && action === "admin-alert-schedules") {
-      if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+      if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
       return adminAlertSchedules();
     }
     if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
-    if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+    if (!isAdmin(req)) return reply({ error: "Admin session expired." }, 401);
     if (action === "admin-change-passcode") return changePasscode(body);
     if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body));
     if (action === "admin-delete-event") return runAudited(req, action, body, () => deleteEvent(body));
