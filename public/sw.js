@@ -1,4 +1,4 @@
-const SHELL_CACHE = "bpt-shell-v1";
+const SHELL_CACHE = "bpt-shell-v2";
 const SHELL_ASSETS = ["/", "/manifest.webmanifest", "/js/experience-utils.js", "/js/a11y-enhancements.js", "/assets/tennis-app-icon.png"];
 
 self.addEventListener("install", event => {
@@ -16,14 +16,27 @@ self.addEventListener("fetch", event => {
     event.respondWith(fetch(request).then(response => { const copy = response.clone(); caches.open(SHELL_CACHE).then(cache => cache.put("/", copy)); return response; }).catch(() => caches.match("/")));
     return;
   }
+  // Keep helper scripts and styles fresh after a deploy while still falling
+  // back to the cached copy when a device is offline.
+  if (["script", "style"].includes(request.destination)) {
+    event.respondWith(fetch(request).then(response => {
+      const copy = response.clone();
+      caches.open(SHELL_CACHE).then(cache => cache.put(request, copy));
+      return response;
+    }).catch(() => caches.match(request)));
+    return;
+  }
   event.respondWith(caches.match(request).then(cached => cached || fetch(request).then(response => { const copy = response.clone(); caches.open(SHELL_CACHE).then(cache => cache.put(request, copy)); return response; })));
 });
 
 self.addEventListener("push", event => {
-  const data = event.data ? event.data.json() : {};
-  const title = data.title || "Banglas Playing Tennis";
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch { return; }
+  const title = String(data.title || "").trim();
+  const body = String(data.body || "").trim();
+  if (!title || !body) return;
   event.waitUntil(self.registration.showNotification(title, {
-    body: data.body || "There is an update from the tennis club.",
+    body,
     icon: data.icon || "/assets/tennis-app-icon.png",
     badge: data.badge || "/assets/tennis-app-icon.png",
     tag: data.tag || "bpt-update",

@@ -27,15 +27,25 @@ function displayDate(event) {
   return new Intl.DateTimeFormat("en-AU", { timeZone: SYDNEY, weekday: "short", day: "numeric", month: "short" }).format(new Date(`${event.event_date}T12:00:00Z`));
 }
 
+function eventDetails(event) {
+  const courtOne = `${event.court_1_name || "Court 1"} ${String(event.start_time).slice(0, 5)}–${String(event.end_time).slice(0, 5)}`;
+  const courtTwo = event.court_2_enabled ? ` · ${event.court_2_name || "Court 2"} ${String(event.court_2_start_time).slice(0, 5)}–${String(event.court_2_end_time).slice(0, 5)}` : "";
+  return `${event.location}, ${event.suburb} · ${courtOne}${courtTwo}`;
+}
+
+function deadlineLabel(deadline, timeZone = SYDNEY) {
+  return new Intl.DateTimeFormat("en-AU", { timeZone, weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }).format(new Date(deadline));
+}
+
 function paymentShare(event, attendingCount) {
   return Number(((Number(event.court_fee) + (event.court_2_enabled ? Number(event.court_2_fee || 0) : 0)) / attendingCount + Number(event.ball_fee || 0)).toFixed(2));
 }
 
 const DEFAULT_PAYMENT_SCHEDULES = [
-  { code: "payment-30m", name: "30 minutes after session completion", notification_type: "payments", delay_minutes: 30, repeat_interval_minutes: null, title_template: "Payment is now open", body_template: "{date}: ${amount} is due. Payment PayID: {payid}.", enabled: true, sort_order: 10 },
-  { code: "payment-12h", name: "12 hours after session completion", notification_type: "payments", delay_minutes: 720, repeat_interval_minutes: null, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 20 },
-  { code: "payment-36h", name: "36 hours after session completion", notification_type: "payments", delay_minutes: 2160, repeat_interval_minutes: null, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 30 },
-  { code: "payment-daily", name: "Every 24 hours until paid", notification_type: "payments", delay_minutes: 3600, repeat_interval_minutes: 1440, title_template: "Payment reminder", body_template: "{date}: ${amount} is still outstanding. Payment PayID: {payid}.", enabled: true, sort_order: 40 },
+  { code: "payment-30m", name: "30 minutes after session completion", notification_type: "payments", delay_minutes: 30, repeat_interval_minutes: null, title_template: "Payment due · {date}", body_template: "{date}: ${amount} is due at {location}. PayID {payid}.", enabled: true, sort_order: 10 },
+  { code: "payment-12h", name: "12 hours after session completion", notification_type: "payments", delay_minutes: 720, repeat_interval_minutes: null, title_template: "Payment overdue · {date}", body_template: "{date}: ${amount} is still outstanding at {location}. PayID {payid}.", enabled: true, sort_order: 20 },
+  { code: "payment-36h", name: "36 hours after session completion", notification_type: "payments", delay_minutes: 2160, repeat_interval_minutes: null, title_template: "Payment overdue · {date}", body_template: "{date}: ${amount} is still outstanding at {location}. PayID {payid}.", enabled: true, sort_order: 30 },
+  { code: "payment-daily", name: "Every 24 hours until paid", notification_type: "payments", delay_minutes: 3600, repeat_interval_minutes: 1440, title_template: "Payment overdue · {date}", body_template: "{date}: ${amount} is still outstanding at {location}. PayID {payid}.", enabled: true, sort_order: 40 },
 ];
 
 async function paymentSchedules() {
@@ -110,10 +120,10 @@ export default async () => {
     const label = displayDate(event);
 
     if (now >= deadline - 24 * 60 * 60 * 1000 && now < deadline) {
-      await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-24h:${event.id}`, eventId: event.id, title: "Tennis EOI closes tomorrow", body: `${label}: reply before ${event.start_time.slice(0, 5)} on Wednesday.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
+      await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-24h:${event.id}`, eventId: event.id, title: `EOI closes tomorrow · ${label}`, body: `${label} at ${event.location}, ${event.suburb}: reply by ${deadlineLabel(deadline, event.timezone || SYDNEY)} to confirm your spot.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
     }
     if (now >= deadline - 60 * 60 * 1000 && now < deadline) {
-      await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-1h:${event.id}`, eventId: event.id, title: "EOI closing soon", body: `${label}: there is one hour left to confirm your spot.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
+      await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-1h:${event.id}`, eventId: event.id, title: `EOI closes in 1 hour · ${label}`, body: `${label} at ${event.location}, ${event.suburb}: reply by ${deadlineLabel(deadline, event.timezone || SYDNEY)} to confirm your spot.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
     }
     if (attending.length && unpaid.length && now >= endsAt && !event.account_closed) {
       const amount = paymentShare(event, attending.length).toFixed(2);
@@ -124,14 +134,18 @@ export default async () => {
         if (now - endsAt < delayMs) continue;
         const occurrence = repeatMs > 0 ? Math.floor((now - endsAt - delayMs) / repeatMs) : 0;
         const notificationKey = `payment-schedule:${schedule.code}:${event.id}:${occurrence}`;
-        await notifyPlayers({ playerIds: unpaid, notificationType: "payments", notificationKey, eventId: event.id, title: scheduleText(schedule.title_template, values), body: scheduleText(schedule.body_template, values), url: `/?page=payments&event=${encodeURIComponent(event.id)}`, audience: "attending" });
+        const renderedTitle = scheduleText(schedule.title_template, values);
+        const renderedBody = scheduleText(schedule.body_template, values);
+        const title = renderedTitle.includes(label) ? renderedTitle : `${renderedTitle} · ${label}`;
+        const body = renderedBody.includes(values.location) ? renderedBody : `${renderedBody} Location: ${values.location}.`;
+        await notifyPlayers({ playerIds: unpaid, notificationType: "payments", notificationKey, eventId: event.id, title, body, url: `/?page=payments&event=${encodeURIComponent(event.id)}`, audience: "attending" });
       }
     }
     if (attending.length && now < startsAt && event.cancellation_status !== "cancelled") {
       try {
         const rainChance = await matchRainChance(event);
         if (rainChance != null && rainChance > 50) {
-          await notifyPlayers({ playerIds: attending, notificationType: "session", notificationKey: `weather-rain:${event.id}:${event.event_date}`, eventId: event.id, title: "Rain forecast for tennis", body: `${label}: ${rainChance}% chance of rain during your session at ${event.location}. Check the forecast before you travel.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
+          await notifyPlayers({ playerIds: attending, notificationType: "session", notificationKey: `weather-rain:${event.id}:${event.event_date}`, eventId: event.id, title: `Rain likely · ${label}`, body: `${label} at ${eventDetails(event)}: ${rainChance}% chance of rain during your session. Check the forecast before travelling.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
         }
       } catch (error) {
         console.error("Weather alert check failed", event.id, error);

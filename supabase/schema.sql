@@ -298,7 +298,7 @@ create table if not exists public.push_alert_schedules (
   delay_minutes integer not null default 0 check (delay_minutes >= 0),
   repeat_interval_minutes integer check (repeat_interval_minutes is null or repeat_interval_minutes > 0),
   title_template text not null default 'Tennis payment reminder',
-  body_template text not null default '{date}: ${amount} is still outstanding. PayID {payid}.',
+  body_template text not null default '{date}: ${amount} is still outstanding at {location}. PayID {payid}.',
   enabled boolean not null default true,
   sort_order integer not null default 0,
   created_at timestamptz not null default now(),
@@ -310,13 +310,13 @@ insert into public.push_alert_schedules
   (code, name, notification_type, delay_minutes, repeat_interval_minutes, title_template, body_template, sort_order)
 values
   ('payment-30m', '30 minutes after session completion', 'payments', 30, null,
-   'Payment is now open', '{date}: ${amount} is due. Payment PayID: {payid}.', 10),
+   'Payment due · {date}', '{date}: ${amount} is due at {location}. PayID {payid}.', 10),
   ('payment-12h', '12 hours after session completion', 'payments', 720, null,
-   'Payment reminder', '{date}: ${amount} is still outstanding. Payment PayID: {payid}.', 20),
+   'Payment overdue · {date}', '{date}: ${amount} is still outstanding at {location}. PayID {payid}.', 20),
   ('payment-36h', '36 hours after session completion', 'payments', 2160, null,
-   'Payment reminder', '{date}: ${amount} is still outstanding. Payment PayID: {payid}.', 30),
+   'Payment overdue · {date}', '{date}: ${amount} is still outstanding at {location}. PayID {payid}.', 30),
   ('payment-daily', 'Every 24 hours until paid', 'payments', 3600, 1440,
-   'Payment reminder', '{date}: ${amount} is still outstanding. Payment PayID: {payid}.', 40)
+   'Payment overdue · {date}', '{date}: ${amount} is still outstanding at {location}. PayID {payid}.', 40)
 on conflict (code) do nothing;
 
 create table if not exists public.badges (
@@ -452,6 +452,7 @@ create table if not exists public.player_notifications (
   body text not null,
   url text not null default '/?page=play',
   dedupe_key text not null,
+  group_key text,
   read_at timestamptz,
   created_at timestamptz not null default now(),
   unique (player_id, dedupe_key)
@@ -460,6 +461,8 @@ alter table public.player_notifications enable row level security;
 revoke all on public.player_notifications from anon, authenticated;
 create index if not exists player_notifications_player_read_created_idx
   on public.player_notifications (player_id, read_at, created_at desc);
+create index if not exists player_notifications_group_idx
+  on public.player_notifications (player_id, group_key, created_at desc);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('tennis-media', 'tennis-media', false, 52428800, array['image/*','video/*'])
@@ -591,3 +594,34 @@ create index if not exists player_sessions_player_idx on public.player_sessions(
 create index if not exists player_sessions_active_idx on public.player_sessions(session_id) where revoked_at is null;
 alter table public.player_sessions enable row level security;
 revoke all on public.player_sessions from anon, authenticated;
+
+-- Admin sessions, point idempotency and scorer leases (also delivered as
+-- migration 036 for installations created from an earlier schema).
+create table if not exists public.admin_sessions (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null unique,
+  label text not null default 'Admin browser',
+  created_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  revoked_at timestamptz
+);
+create index if not exists admin_sessions_active_idx on public.admin_sessions(session_id) where revoked_at is null;
+alter table public.admin_sessions enable row level security;
+revoke all on public.admin_sessions from anon, authenticated;
+
+create table if not exists public.live_point_actions (
+  action_id uuid primary key,
+  live_match_id uuid not null references public.live_matches(id) on delete cascade,
+  winner text not null check (winner in ('a','b')),
+  status text not null default 'applied' check (status in ('pending','applied')),
+  result jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists live_point_actions_match_idx on public.live_point_actions(live_match_id, created_at);
+alter table public.live_point_actions enable row level security;
+revoke all on public.live_point_actions from anon, authenticated;
+
+alter table public.live_matches
+  add column if not exists active_scorer_id uuid references public.players(id) on delete set null,
+  add column if not exists scorer_lease_until timestamptz;
+create index if not exists live_matches_scorer_idx on public.live_matches(active_scorer_id, scorer_lease_until);

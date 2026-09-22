@@ -1,5 +1,9 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Payment email reminders are intentionally deferred. Push reminders remain
+// active in push-reminders.mjs; this legacy function is opt-in only and cannot
+// send email in a normal deployment.
+const EMAIL_REMINDERS_ENABLED = process.env.ENABLE_EMAIL_REMINDERS === "true";
 
 async function db(path, options = {}) {
   const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -56,6 +60,7 @@ async function log(eventId, playerId, type) {
 }
 
 export default async () => {
+  if (!EMAIL_REMINDERS_ENABLED) return new Response("Email reminders are disabled.", { status: 200 });
   if (!SUPABASE_URL || !SERVICE_KEY) throw new Error("Supabase environment variables are missing.");
   const now = Date.now();
   const [events, players, eois, payments] = await Promise.all([
@@ -79,8 +84,8 @@ export default async () => {
         if (await alreadyLogged(event.id, player.id, "48_hour_player")) continue;
         await email(
           player.email,
-          `Tennis payment reminder — ${event.event_date}`,
-          `<p>Hi ${player.name},</p><p>Your tennis payment for ${event.event_date} is still outstanding.</p><p>Payment PayID: 0420451170</p>`,
+          `Payment overdue — ${event.event_date} · ${event.location}, ${event.suburb}`,
+          `<p>Hi ${player.name},</p><p>Your tennis payment for ${event.event_date} at ${event.location}, ${event.suburb} is still outstanding.</p><p>Payment PayID: 0420451170</p>`,
         );
         await log(event.id, player.id, "48_hour_player");
       }
@@ -90,8 +95,8 @@ export default async () => {
       const list = outstanding.length ? outstanding.map(player => player.name).join(", ") : "Everyone has paid";
       await email(
         process.env.ADMIN_EMAIL,
-        `Tennis payment status — ${event.event_date}`,
-        `<p>Payment status after 72 hours:</p><p>${list}</p>`,
+        `Payment status — ${event.event_date} · ${event.location}, ${event.suburb}`,
+        `<p>Payment status for ${event.event_date} at ${event.location}, ${event.suburb} after 72 hours:</p><p>${list}</p>`,
       );
       await log(event.id, null, "72_hour_admin");
     }
@@ -99,4 +104,3 @@ export default async () => {
 
   return new Response("Reminder check complete", { status: 200 });
 };
-
