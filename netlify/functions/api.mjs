@@ -712,17 +712,21 @@ function badgePayload(body) {
     if (!Number.isInteger(number) || number < min || number > 100000) throw new Error(`${label} must be a whole number.`);
     return number;
   };
-  const decimal = (value, label) => {
+  const decimal = (value, label, max = 100) => {
     if (value === "" || value === null || value === undefined) return null;
     const number = Number(value);
-    if (!Number.isFinite(number) || number < 0 || number > 100) throw new Error(`${label} must be between 0 and 100.`);
+    if (!Number.isFinite(number) || number < 0 || number > max) throw new Error(`${label} must be between 0 and ${max}.`);
     return number;
   };
-  let minPlayed, minWins, minAttendance, minPointDiff, minWinPct, minPaidRate;
+  let minPlayed, minWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
   try {
     minPlayed = integer(body.minPlayed, "Minimum matches played");
     minWins = integer(body.minWins, "Minimum wins");
     minAttendance = integer(body.minAttendance, "Minimum sessions attended");
+    matchWindow = integer(body.matchWindow, "Recent match window", 1);
+    attendanceWindow = integer(body.attendanceWindow, "Recent attendance window", 1);
+    paymentWithinHours = decimal(body.paymentWithinHours, "Payment completion window", 720);
+    if (paymentWithinHours !== null && paymentWithinHours <= 0) throw new Error("Payment completion window must be greater than 0 hours.");
     minPointDiff = body.minPointDiff === "" || body.minPointDiff === null || body.minPointDiff === undefined ? null : Number(body.minPointDiff);
     if (minPointDiff !== null && (!Number.isInteger(minPointDiff) || minPointDiff < -100000 || minPointDiff > 100000)) throw new Error("Minimum point differential must be a whole number.");
     minWinPct = decimal(body.minWinPct, "Minimum win percentage");
@@ -730,7 +734,7 @@ function badgePayload(body) {
   } catch (error) { return { error: error.message }; }
   const fallbackType = ["played", "no_played"].includes(body.fallbackType) ? body.fallbackType : null;
   const sortOrder = Number.isInteger(Number(body.sortOrder)) ? Math.max(0, Math.min(10000, Number(body.sortOrder))) : 100;
-  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
+  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
 }
 
 async function saveBadge(body) {
