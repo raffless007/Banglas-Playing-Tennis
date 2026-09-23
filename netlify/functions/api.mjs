@@ -524,12 +524,17 @@ function hydrateEventLocations(events, locations) {
   return (events || []).map(event => {
     const linked = (event.location_id && byId.get(event.location_id)) || byLabel.get(`${String(event.location || '').trim().toLowerCase()}|${String(event.suburb || '').trim().toLowerCase()}`);
     if (!linked) return event;
+    const placeUrl = linked.google_maps_url || (linked.google_place_id
+      ? `https://www.google.com/maps/search/?api=1&query=Google&query_place_id=${encodeURIComponent(linked.google_place_id)}`
+      : null);
     return {
       ...event,
       location_id: event.location_id || linked.id,
       // Null means “use the linked location default”; an empty string remains
       // an intentional per-event override that hides a PIN.
       entry_pin: event.entry_pin == null ? (linked.entry_pin || null) : event.entry_pin,
+      google_place_id: event.google_place_id || linked.google_place_id || null,
+      google_maps_url: event.google_maps_url || placeUrl,
     };
   });
 }

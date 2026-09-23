@@ -284,7 +284,8 @@
       if(weather&&details&&details.previousElementSibling!==weather)details.parentElement.insertBefore(weather,details);
       if(!$('eventQuickActions'))document.querySelector('.response')?.insertAdjacentHTML('afterend','<div id="eventQuickActions" class="card share-row" style="padding:14px;margin-top:14px"></div>');
       $('eventQuickActions').innerHTML='<button id="directionsBtn" class="secondary">Get directions</button><button id="itineraryBtn" class="secondary">Add to calendar</button>';
-      $('directionsBtn').onclick=()=>window.open(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${event.location}, ${event.suburb}`)}`,'_blank','noopener');
+      const directionsUrl=()=>{const saved=String(event.google_maps_url||'').trim();if(saved.startsWith('https://www.google.com/maps/'))return saved;if(event.google_place_id)return`https://www.google.com/maps/search/?api=1&query=Google&query_place_id=${encodeURIComponent(event.google_place_id)}`;return`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${event.location}, ${event.suburb}`)}`};
+      $('directionsBtn').onclick=()=>window.open(directionsUrl(),'_blank','noopener,noreferrer');
       $('itineraryBtn').onclick=()=>downloadIcs(event);
       const open=new Date()<deadlineFor(event),mine=eoi(event.id),yes=eventPlayers(event.id),waitlisted=eventVisiblePlayers(event.id).filter(p=>eoi(event.id,p.id)?.status==='yes'&&eoi(event.id,p.id)?.waitlist_position!=null),no=activePlayers().filter(p=>eoi(event.id,p.id)?.status==='no'),pending=activePlayers().filter(p=>!eoi(event.id,p.id));
       $('eventDate').textContent=fmt(new Date(event.event_date+'T12:00:00'));
