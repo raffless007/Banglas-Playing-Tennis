@@ -84,6 +84,7 @@ Set their scope to **Functions** where Netlify offers a scope choice.
 | `WEBAUTHN_RP_NAME` | Human-readable passkey name, normally `Banglas Playing Tennis` |
 | `WEBAUTHN_RP_ID` | Stable hostname, normally `banglasplayingtennis.netlify.app` (do not change after enrollment) |
 | `WEBAUTHN_ORIGINS` | Comma-separated allowed origins, e.g. `https://banglasplayingtennis.netlify.app` |
+| `GOOGLE_PLACES_API_KEY` | Google Maps Platform Places API key used server-side by the Admin location search. Restrict it to Places API (New) and the production Netlify environment. |
 
 Never put the service-role key or VAPID private key in `public/index.html`,
 GitHub, or any browser code. After adding variables, trigger a new Netlify

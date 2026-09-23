@@ -39,6 +39,9 @@ const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
 const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || "Banglas Playing Tennis";
 const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || "";
 const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean);
+// Server-side Google Places key. Keep this out of the browser; the Admin
+// location editor uses the protected proxy below for autocomplete/details.
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || process.env.GOOGLE_MAPS_PLACES_API_KEY || "";
 const rateBuckets = new Map();
 const signedMediaUrlCache = new Map();
 
@@ -1547,6 +1550,11 @@ async function saveLocation(body) {
   const update = {
     name,
     suburb,
+    google_place_id: body.googlePlaceId == null ? null : String(body.googlePlaceId).trim().slice(0, 200),
+    address: body.address == null ? null : String(body.address).trim().slice(0, 240),
+    latitude: body.latitude == null || body.latitude === '' ? null : Number(body.latitude),
+    longitude: body.longitude == null || body.longitude === '' ? null : Number(body.longitude),
+    google_maps_url: body.googleMapsUrl == null ? null : String(body.googleMapsUrl).trim().slice(0, 500),
     entry_pin: body.entryPin == null ? null : String(body.entryPin).trim().slice(0, 40),
     court_1_fee: Math.max(0, Number(body.court1Fee || 0)),
     court_2_fee: Math.max(0, Number(body.court2Fee || 0)),
@@ -1555,6 +1563,8 @@ async function saveLocation(body) {
     updated_at: new Date().toISOString(),
   };
   if (!Number.isFinite(update.court_1_fee) || !Number.isFinite(update.court_2_fee) || !Number.isFinite(update.ball_fee)) return reply({ error: "Fees must be valid numbers." }, 400);
+  if (update.latitude != null && (!Number.isFinite(update.latitude) || update.latitude < -90 || update.latitude > 90)) return reply({ error: "Latitude must be between -90 and 90." }, 400);
+  if (update.longitude != null && (!Number.isFinite(update.longitude) || update.longitude < -180 || update.longitude > 180)) return reply({ error: "Longitude must be between -180 and 180." }, 400);
   const query = body.id ? `locations?id=eq.${encodeURIComponent(body.id)}` : "locations";
   const result = await db(query + (body.id ? "" : "?on_conflict=name,suburb"), {
     method: body.id ? "PATCH" : "POST",
@@ -1562,6 +1572,52 @@ async function saveLocation(body) {
     body: JSON.stringify(update),
   });
   return reply({ ok: true, result });
+}
+
+async function adminPlaceSearch(body) {
+  if (!GOOGLE_PLACES_API_KEY) return reply({ error: "Google Places is not configured yet. Add GOOGLE_PLACES_API_KEY in Netlify environment variables." }, 503);
+  const placeId = String(body.placeId || '').trim();
+  const input = String(body.input || '').trim();
+  if (!placeId && input.length < 2) return reply({ error: "Enter at least two characters to search." }, 400);
+  try {
+    if (placeId) {
+      const response = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+        headers: {
+          "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+          "X-Goog-FieldMask": "id,displayName,formattedAddress,addressComponents,location,googleMapsUri",
+        },
+      });
+      if (!response.ok) throw new Error(`Place details request failed (${response.status})`);
+      const place = await response.json();
+      return reply({ place: {
+        id: place.id || placeId,
+        name: place.displayName?.text || "",
+        address: place.formattedAddress || "",
+        suburb: (place.addressComponents || []).find(component => (component.types || []).includes("locality"))?.longText || (place.addressComponents || []).find(component => (component.types || []).includes("postal_town"))?.longText || "",
+        latitude: place.location?.latitude ?? null,
+        longitude: place.location?.longitude ?? null,
+        googleMapsUrl: place.googleMapsUri || "",
+      } });
+    }
+    const response = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": "suggestions.placePrediction.placeId,suggestions.placePrediction.text,suggestions.placePrediction.structuredFormat",
+      },
+      body: JSON.stringify({ input, includedRegionCodes: ["au"], languageCode: "en" }),
+    });
+    if (!response.ok) throw new Error(`Places autocomplete request failed (${response.status})`);
+    const payload = await response.json();
+    return reply({ suggestions: (payload.suggestions || []).map(item => {
+      const prediction = item.placePrediction || {};
+      return { placeId: prediction.placeId || "", text: prediction.text?.text || "", mainText: prediction.structuredFormat?.mainText?.text || "", secondaryText: prediction.structuredFormat?.secondaryText?.text || "" };
+    }).filter(item => item.placeId) });
+  } catch (error) {
+    console.error("Google Places request failed", error?.message || error);
+    return reply({ error: "Google Places could not complete that search." }, 502);
+  }
 }
 
 async function adminRejectWaitlist(body) {
@@ -2428,6 +2484,10 @@ export default async (req) => {
     if (req.method === "POST" && action === "notification-read") return markNotificationRead(body);
     if (req.method === "POST" && action === "notification-read-all") return markNotificationRead(body, true);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
+    if (req.method === "POST" && action === "admin-place-search") {
+      if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+      return adminPlaceSearch(body);
+    }
     if (req.method === "GET" && action === "admin-state") {
       if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
       return reply(await adminState());

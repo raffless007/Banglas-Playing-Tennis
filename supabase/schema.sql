@@ -24,6 +24,11 @@ create table if not exists public.locations (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   suburb text not null default '',
+  google_place_id text,
+  address text,
+  latitude double precision,
+  longitude double precision,
+  google_maps_url text,
   entry_pin text,
   court_1_fee numeric(10,2) not null default 54.00,
   court_2_fee numeric(10,2) not null default 0.00,
@@ -33,6 +38,10 @@ create table if not exists public.locations (
   updated_at timestamptz not null default now(),
   unique (name, suburb)
 );
+
+create unique index if not exists locations_google_place_id_idx
+  on public.locations (google_place_id)
+  where google_place_id is not null;
 insert into public.locations (name, suburb, court_1_fee, court_2_fee, ball_fee)
 values
   ('Civic Park Tennis Courts', 'Pendle Hill', 54.00, 0.00, 1.00),
