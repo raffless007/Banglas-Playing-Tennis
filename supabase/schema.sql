@@ -600,7 +600,7 @@ insert into public.players (name) values
   ('Farhan Ashik'),
   ('Ihsaan M. Chowdhury'),
   ('Inzamam Haque'),
-  ('Mohammad Eram'),
+  ('Eram'),
   ('Rahat Iqbal'),
   ('Redwan Khandker'),
   ('Rizwan Chowdhury'),
