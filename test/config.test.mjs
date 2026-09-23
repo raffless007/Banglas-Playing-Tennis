@@ -6,6 +6,7 @@ const index = await readFile(new URL("../public/index.html", import.meta.url), "
 const api = await readFile(new URL("../netlify/functions/api.mjs", import.meta.url), "utf8");
 const sw = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url), "utf8");
+const badgePresets = await readFile(new URL("../supabase/migrations/045_badge_rule_presets.sql", import.meta.url), "utf8");
 
 test("security headers and app entry points are present", async () => {
   const netlify = await readFile(new URL("../netlify.toml", import.meta.url), "utf8");
@@ -45,6 +46,21 @@ test("startup failures cannot leave the loading overlay covering the app", () =>
 test("high-risk production constants are not accidentally reduced", () => {
   assert.match(api, /MEDIA_TOTAL_BYTES\s*=\s*5\s*\*\s*1024\s*\*\s*1024\s*\*\s*1024/);
   assert.match(api, /SCORING_WINDOW_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
+});
+
+test("badge rules support recent samples, payment deadlines, and editable maximum wins", () => {
+  assert.match(index, /matchWindow\?m\.recentMatches\.slice\(0,matchWindow\):m\.recentMatches/);
+  assert.match(index, /attendanceWindow\?m\.completedEvents\.slice\(0,attendanceWindow\):m\.attendanceEvents/);
+  assert.match(index, /paymentRateWithin\(def\.payment_within_hours\)/);
+  assert.match(index, /name="maxWins"/);
+  assert.match(index, /MATCH SAMPLE — MOST RECENT N/);
+  assert.match(index, /SESSION SAMPLE — MOST RECENT N/);
+  assert.match(api, /max_wins: maxWins/);
+  assert.match(api, /payment_within_hours: paymentWithinHours/);
+  assert.match(badgePresets, /where name = 'Form King';/);
+  assert.match(badgePresets, /where name = 'Disgrace';/);
+  assert.match(badgePresets, /match_window = 5/);
+  assert.match(badgePresets, /payment_within_hours = 24/);
 });
 
 test("the inline app script remains valid JavaScript", () => {
