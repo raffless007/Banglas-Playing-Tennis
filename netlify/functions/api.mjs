@@ -494,6 +494,33 @@ async function listVisibleEvents() {
   }
 }
 
+async function listLocations() {
+  try {
+    return await db("locations?select=*&order=active.desc,name.asc,suburb.asc");
+  } catch (error) {
+    // Keep the recovered build usable during the short window before the
+    // location migration is applied.
+    console.error("Location catalogue unavailable", error?.message || error);
+    return [];
+  }
+}
+
+function hydrateEventLocations(events, locations) {
+  const byId = new Map((locations || []).map(location => [location.id, location]));
+  const byLabel = new Map((locations || []).map(location => [`${String(location.name || '').trim().toLowerCase()}|${String(location.suburb || '').trim().toLowerCase()}`, location]));
+  return (events || []).map(event => {
+    const linked = (event.location_id && byId.get(event.location_id)) || byLabel.get(`${String(event.location || '').trim().toLowerCase()}|${String(event.suburb || '').trim().toLowerCase()}`);
+    if (!linked) return event;
+    return {
+      ...event,
+      location_id: event.location_id || linked.id,
+      // Null means “use the linked location default”; an empty string remains
+      // an intentional per-event override that hides a PIN.
+      entry_pin: event.entry_pin == null ? (linked.entry_pin || null) : event.entry_pin,
+    };
+  });
+}
+
 async function getPasscodeSetting() {
   const rows = await db("app_settings?key=eq.admin_passcode_hash&select=value");
   return rows?.[0]?.value || null;
@@ -515,7 +542,7 @@ async function appState(req) {
     console.error("Upcoming event maintenance failed", error?.message || error);
     return null;
   });
-  let [playerRows, events, eois, payments, scores, liveMatches, notes, badges] = await Promise.all([
+  let [playerRows, events, eois, payments, scores, liveMatches, notes, badges, locations] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
     listVisibleEvents(),
     db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
@@ -524,12 +551,14 @@ async function appState(req) {
     db("live_matches?select=*&order=updated_at.desc"),
     db("event_notes?select=*"),
     db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
+    listLocations(),
   ]);
   const expectedUpcoming = new Set(upcomingWednesdays());
   if (!(events || []).some(event => expectedUpcoming.has(event.event_date))) {
     await ensurePromise;
     events = await listVisibleEvents();
   }
+  events = hydrateEventLocations(events, locations);
   const admin = await isAdminSession(req);
   const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
   const candidatePlayerId = admin ? null : playerSessionSubject(req);
@@ -563,7 +592,8 @@ async function appState(req) {
   }
   const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
   const authenticated = admin || Boolean(playerId);
-  return { players, events: authenticated ? events : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  const publicEvents = admin ? events : events.map(event => (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) < new Date() ? { ...event, entry_pin: null } : event));
+  return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function mediaState(req) {
@@ -592,11 +622,12 @@ async function eoiState() {
 }
 
 async function adminState() {
-  const [players, subscriptions, badges, guestHistory] = await Promise.all([
+  const [players, subscriptions, badges, guestHistory, locations] = await Promise.all([
     db("players?select=id,name,active,email,is_guest,guest_event_id,guest_of_player_id,pin_hash,pin_failed_attempts,pin_locked_at&order=name.asc"),
     db("push_subscriptions?select=id,player_id,endpoint,active,updated_at,created_at&active=eq.true"),
     db("badges?select=*&order=sort_order.asc,name.asc").catch(() => []),
     db("guest_history?select=*&order=assigned_at.desc").catch(() => []),
+    listLocations(),
   ]);
   const pushEnabled = new Set((subscriptions || []).map(subscription => subscription.player_id));
   const pushDevices = (subscriptions || []).reduce((map, subscription) => {
@@ -605,7 +636,7 @@ async function adminState() {
     map.set(subscription.player_id, list);
     return map;
   }, new Map());
-  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id), push_devices: pushDevices.get(player.id) || [] })), guestHistory, badges };
+  return { players: players.map(({ pin_hash, ...player }) => ({ ...player, pin_configured: !!pin_hash, push_enabled: pushEnabled.has(player.id), push_devices: pushDevices.get(player.id) || [] })), guestHistory, badges, locations };
 }
 
 async function syncVersion() {
@@ -625,7 +656,8 @@ async function adminBackup(req) {
     // Explicit projections prevent PIN hashes, invite tokens and other
     // authentication material from ever entering an exported backup.
     players: "players?select=id,name,email,mobile,address,avatar_path,is_guest,guest_event_id,guest_of_player_id,active,created_at,pin_updated_at&order=name.asc",
-    events: "events?select=id,event_date,start_time,end_time,timezone,court_1_name,location,suburb,court_fee,court_2_enabled,court_2_name,court_2_start_time,court_2_end_time,court_2_fee,ball_fee,account_closed,max_players,cancellation_status,cancellation_reason,recap_notes,award_player_id,template_name,deleted_at,created_at,updated_at&order=event_date.asc",
+    events: "events?select=id,event_date,start_time,end_time,timezone,location_id,court_1_name,location,suburb,entry_pin,court_fee,court_2_enabled,court_2_name,court_2_start_time,court_2_end_time,court_2_fee,ball_fee,account_closed,max_players,cancellation_status,cancellation_reason,recap_notes,award_player_id,template_name,deleted_at,created_at,updated_at&order=event_date.asc",
+    locations: "locations?select=id,name,suburb,entry_pin,court_1_fee,court_2_fee,ball_fee,active,created_at,updated_at&order=name.asc,suburb.asc",
     eois: "eois?select=*",
     payments: "payments?select=*",
     scores: "match_scores?select=*&order=created_at.asc",
@@ -1457,7 +1489,7 @@ async function changePasscode(body) {
 }
 
 async function saveEvent(body) {
-  const allowed = ["event_date", "start_time", "end_time", "location", "suburb", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed", "max_players", "cancellation_status", "cancellation_reason", "recap_notes", "award_player_id", "template_name"];
+  const allowed = ["event_date", "start_time", "end_time", "location_id", "location", "suburb", "entry_pin", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed", "max_players", "cancellation_status", "cancellation_reason", "recap_notes", "award_player_id", "template_name"];
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
   if ("court_1_name" in update) update.court_1_name = String(update.court_1_name || "Court 1").trim() || "Court 1";
   if ("court_2_name" in update) update.court_2_name = String(update.court_2_name || "Court 2").trim() || "Court 2";
@@ -1488,6 +1520,31 @@ async function saveEvent(body) {
     } catch (error) { console.error("Session push failed", error); }
   }
   return reply({ ok: true });
+}
+
+async function saveLocation(body) {
+  const name = String(body.name || '').trim();
+  const suburb = String(body.suburb || '').trim();
+  if (name.length < 2 || name.length > 120) return reply({ error: "Enter a location name." }, 400);
+  if (suburb.length > 80) return reply({ error: "Suburb must be 80 characters or fewer." }, 400);
+  const update = {
+    name,
+    suburb,
+    entry_pin: body.entryPin == null ? null : String(body.entryPin).trim().slice(0, 40),
+    court_1_fee: Math.max(0, Number(body.court1Fee || 0)),
+    court_2_fee: Math.max(0, Number(body.court2Fee || 0)),
+    ball_fee: Math.max(0, Number(body.ballFee || 0)),
+    active: body.active !== false,
+    updated_at: new Date().toISOString(),
+  };
+  if (!Number.isFinite(update.court_1_fee) || !Number.isFinite(update.court_2_fee) || !Number.isFinite(update.ball_fee)) return reply({ error: "Fees must be valid numbers." }, 400);
+  const query = body.id ? `locations?id=eq.${encodeURIComponent(body.id)}` : "locations";
+  const result = await db(query + (body.id ? "" : "?on_conflict=name,suburb"), {
+    method: body.id ? "PATCH" : "POST",
+    headers: { Prefer: body.id ? "return=minimal" : "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(update),
+  });
+  return reply({ ok: true, result });
 }
 
 async function adminRejectWaitlist(body) {
@@ -2265,6 +2322,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
       else if (body?.scoreId) beforeState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || null;
       else if (body?.mediaId) beforeState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || null;
+      else if (body?.id && action === "admin-save-location") beforeState = (await db(`locations?id=eq.${encodeURIComponent(body.id)}&select=*`))?.[0] || null;
       else if (body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action))) beforeState = (await db(`badges?id=eq.${encodeURIComponent(body.badgeId || body.id)}&select=*`))?.[0] || null;
       else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || null;
     } catch { /* audit must never block the requested action */ }
@@ -2276,6 +2334,7 @@ async function runAudited(req, action, body, operation) {
       if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
       else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
       else if (body?.mediaId) afterState = (await db(`media_items?id=eq.${encodeURIComponent(body.mediaId)}&select=*`))?.[0] || afterState;
+      else if (body?.id && action === "admin-save-location") afterState = (await db(`locations?id=eq.${encodeURIComponent(body.id)}&select=*`))?.[0] || afterState;
       else if (body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action))) afterState = (await db(`badges?id=eq.${encodeURIComponent(body.badgeId || body.id)}&select=*`))?.[0] || afterState;
       else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || afterState;
     } catch { /* ignore */ }
@@ -2370,12 +2429,13 @@ export default async (req) => {
       if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
       return adminAlertSchedules();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-change-passcode", "admin-save-event", "admin-save-location", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
     if (action === "admin-change-passcode") return changePasscode(body);
     if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body));
+    if (action === "admin-save-location") return runAudited(req, action, body, () => saveLocation(body));
     if (action === "admin-delete-event") return runAudited(req, action, body, () => deleteEvent(body));
     if (action === "admin-add-player") return runAudited(req, action, body, () => addPlayer(body));
     if (action === "admin-add-guest") return runAudited(req, action, body, () => addGuest(body));

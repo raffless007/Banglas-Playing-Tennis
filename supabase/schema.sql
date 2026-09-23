@@ -18,15 +18,38 @@ create table if not exists public.players (
   created_at timestamptz not null default now()
 );
 
+-- Reusable court locations. Events keep their own snapshot/override values so
+-- historical weeks remain accurate when a location's defaults change.
+create table if not exists public.locations (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  suburb text not null default '',
+  entry_pin text,
+  court_1_fee numeric(10,2) not null default 54.00,
+  court_2_fee numeric(10,2) not null default 0.00,
+  ball_fee numeric(10,2) not null default 1.00,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (name, suburb)
+);
+insert into public.locations (name, suburb, court_1_fee, court_2_fee, ball_fee)
+values
+  ('Civic Park Tennis Courts', 'Pendle Hill', 54.00, 0.00, 1.00),
+  ('Dirrabarri Tennis Courts', 'Greystanes', 54.00, 0.00, 1.00)
+on conflict (name, suburb) do nothing;
+
 create table if not exists public.events (
   id uuid primary key default gen_random_uuid(),
   event_date date not null unique,
   start_time time not null default '19:30',
   end_time time not null default '22:00',
   timezone text not null default 'Australia/Sydney',
+  location_id uuid references public.locations(id) on delete set null,
   court_1_name text not null default 'Court 1',
   location text not null default 'Civic Park Tennis Courts',
   suburb text not null default 'Pendle Hill',
+  entry_pin text,
   court_fee numeric(10,2) not null default 54.00,
   court_2_enabled boolean not null default false,
   court_2_name text not null default 'Court 2',
@@ -55,6 +78,26 @@ alter table public.events
   add column if not exists guest_invite_token text unique;
 
 alter table public.events add column if not exists deleted_at timestamptz;
+alter table public.events
+  add column if not exists location_id uuid references public.locations(id) on delete set null,
+  add column if not exists entry_pin text;
+update public.events e
+set location_id = l.id
+from public.locations l
+where e.location_id is null
+  and lower(trim(e.location)) = lower(trim(l.name))
+  and lower(trim(coalesce(e.suburb, ''))) = lower(trim(coalesce(l.suburb, '')));
+
+create or replace function public.set_updated_at() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+drop trigger if exists locations_updated_at on public.locations;
+create trigger locations_updated_at before update on public.locations
+for each row execute function public.set_updated_at();
 
 -- Durable guest archive. Guest participation is kept as a snapshot so a guest
 -- can be reused for another week without losing their previous history.
@@ -354,6 +397,7 @@ on conflict (name) do nothing;
 -- The browser never connects directly to these tables. Only Netlify Functions
 -- use the server-side service-role key, so exposed-table access stays closed.
 alter table public.players enable row level security;
+alter table public.locations enable row level security;
 alter table public.events enable row level security;
 alter table public.deleted_event_dates enable row level security;
 alter table public.eois enable row level security;
@@ -366,6 +410,7 @@ alter table public.media_favourites enable row level security;
 alter table public.audit_log enable row level security;
 alter table public.event_templates enable row level security;
 revoke all on table public.audit_log, public.event_templates from anon, authenticated;
+revoke all on table public.locations from anon, authenticated;
 revoke all on table public.media_favourites from anon, authenticated;
 alter table public.app_settings enable row level security;
 alter table public.reminder_log enable row level security;
