@@ -44,6 +44,7 @@ const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(val
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || process.env.GOOGLE_MAPS_PLACES_API_KEY || "";
 const rateBuckets = new Map();
 const signedMediaUrlCache = new Map();
+const locationCache = { value: null, expiresAt: 0, promise: null };
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -508,14 +509,27 @@ async function listVisibleEvents() {
 }
 
 async function listLocations() {
-  try {
-    return await db("locations?select=*&order=active.desc,name.asc,suburb.asc");
-  } catch (error) {
-    // Keep the recovered build usable during the short window before the
-    // location migration is applied.
-    console.error("Location catalogue unavailable", error?.message || error);
-    return [];
-  }
+  if (locationCache.value && locationCache.expiresAt > Date.now()) return locationCache.value;
+  if (locationCache.promise) return locationCache.promise;
+  locationCache.promise = (async () => {
+    let locations = [];
+    try {
+      locations = await db("locations?select=*&order=active.desc,name.asc,suburb.asc");
+    } catch (error) {
+      // Keep the recovered build usable during the short window before the
+      // location migration is applied.
+      console.error("Location catalogue unavailable", error?.message || error);
+    }
+    locationCache.value = locations || [];
+    locationCache.expiresAt = Date.now() + 5 * 60_000;
+    return locationCache.value;
+  })().finally(() => { locationCache.promise = null; });
+  return locationCache.promise;
+}
+
+function invalidateLocationCache() {
+  locationCache.value = null;
+  locationCache.expiresAt = 0;
 }
 
 function hydrateEventLocations(events, locations) {
@@ -603,8 +617,7 @@ async function appState(req) {
     if (admin || payment.player_id === playerId) return payment;
     return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
   });
-  let notificationReadPromise = Promise.resolve([]);
-  let notificationWritePromise = Promise.resolve();
+  let notifications = [];
   if (playerId) {
     const pending = [];
     for (const event of events) {
@@ -613,13 +626,20 @@ async function appState(req) {
       const paid = payments.some(row => row.event_id === event.id && row.player_id === playerId && row.paid);
       if (inThisWeek && !paid) pending.push({ player_id: playerId, event_id: event.id, notification_type: "payments", title: `Payment due · ${eventLabel(event)}`, body: `${eventLabel(event)} at ${event.location}, ${event.suburb}: payment is due. PayID 0420451170.`, url: `/?page=payments&event=${encodeURIComponent(event.id)}`, dedupe_key: `payment-pending:${event.id}` });
     }
-    notificationWritePromise = createPlayerNotifications(pending).catch(() => {});
-    notificationReadPromise = db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []);
+    // Notification maintenance is deliberately off the critical state path.
+    // The inbox loads immediately after the clubhouse has painted.
+    void createPlayerNotifications(pending).catch(() => {});
   }
-  const [notifications] = await Promise.all([notificationReadPromise, notificationWritePromise]);
   const authenticated = admin || Boolean(playerId);
   const publicEvents = admin ? events : events.map(event => (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) < new Date() ? { ...event, entry_pin: null } : event));
   return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+}
+
+async function playerNotificationState(req) {
+  const playerId = playerSessionSubject(req);
+  if (!playerId || !(await isPlayer(req, playerId))) return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
+  const notifications = await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []);
+  return reply({ notifications, serverNow: new Date().toISOString() });
 }
 
 async function mediaState(req) {
@@ -1582,6 +1602,7 @@ async function saveLocation(body) {
     headers: { Prefer: body.id ? "return=minimal" : "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify(update),
   });
+  invalidateLocationCache();
   return reply({ ok: true, result });
 }
 
@@ -2491,6 +2512,7 @@ export default async (req) => {
     }
 
     if (req.method === "GET" && action === "state") return reply(await appState(req));
+    if (req.method === "GET" && action === "notification-state") return playerNotificationState(req);
     if (req.method === "GET" && action === "media-state") return mediaState(req);
     if (req.method === "GET" && action === "live-state") return liveState();
     if (req.method === "GET" && action === "eoi-state") return eoiState();
