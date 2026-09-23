@@ -209,6 +209,16 @@ async function mediaUrl(path) {
   return data.signedUrl;
 }
 
+async function mediaUrlForState(path) {
+  // Avatar signing should never hold the entire clubhouse response hostage.
+  // The signing promise is allowed to finish and warm the cache, while the
+  // first paint falls back to initials if storage is slow or unavailable.
+  return Promise.race([
+    mediaUrl(path),
+    new Promise(resolve => setTimeout(() => resolve(null), 900)),
+  ]);
+}
+
 async function auditActor(req) {
   if (await isAdminSession(req)) return { actor_type: "admin", actor_player_id: null, actor_name: ADMIN_DISPLAY_NAME };
   const playerId = playerSessionSubject(req);
@@ -542,6 +552,11 @@ async function appState(req) {
     console.error("Upcoming event maintenance failed", error?.message || error);
     return null;
   });
+  const adminPromise = isAdminSession(req);
+  const candidatePlayerId = playerSessionSubject(req);
+  const playerValidationPromise = candidatePlayerId
+    ? isPlayer(req, candidatePlayerId)
+    : Promise.resolve(false);
   let [playerRows, events, eois, payments, scores, liveMatches, notes, badges, locations] = await Promise.all([
     db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
     listVisibleEvents(),
@@ -559,10 +574,9 @@ async function appState(req) {
     events = await listVisibleEvents();
   }
   events = hydrateEventLocations(events, locations);
-  const admin = await isAdminSession(req);
+  const admin = await adminPromise;
   const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
-  const candidatePlayerId = admin ? null : playerSessionSubject(req);
-  const playerId = candidatePlayerId && await isPlayer(req, candidatePlayerId) ? candidatePlayerId : null;
+  const playerId = !admin && candidatePlayerId && await playerValidationPromise ? candidatePlayerId : null;
   const players = await Promise.all((playerRows || []).map(async player => ({
     id: player.id,
     name: player.name,
@@ -573,13 +587,15 @@ async function appState(req) {
     pin_configured: Boolean(player.pin_hash),
     email: player.email || "",
     mobile: player.mobile || "",
-    avatar_url: player.avatar_path ? await mediaUrl(player.avatar_path) : null,
+    avatar_url: player.avatar_path ? await mediaUrlForState(player.avatar_path) : null,
     ...(admin || player.id === playerId ? { address: player.address || "" } : {}),
   })));
   const visiblePayments = payments.map(payment => {
     if (admin || payment.player_id === playerId) return payment;
     return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
   });
+  let notificationReadPromise = Promise.resolve([]);
+  let notificationWritePromise = Promise.resolve();
   if (playerId) {
     const pending = [];
     for (const event of events) {
@@ -588,9 +604,10 @@ async function appState(req) {
       const paid = payments.some(row => row.event_id === event.id && row.player_id === playerId && row.paid);
       if (inThisWeek && !paid) pending.push({ player_id: playerId, event_id: event.id, notification_type: "payments", title: `Payment due · ${eventLabel(event)}`, body: `${eventLabel(event)} at ${event.location}, ${event.suburb}: payment is due. PayID 0420451170.`, url: `/?page=payments&event=${encodeURIComponent(event.id)}`, dedupe_key: `payment-pending:${event.id}` });
     }
-    await createPlayerNotifications(pending).catch(() => {});
+    notificationWritePromise = createPlayerNotifications(pending).catch(() => {});
+    notificationReadPromise = db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []);
   }
-  const notifications = playerId ? await db(`player_notifications?player_id=eq.${encodeURIComponent(playerId)}&select=id,event_id,notification_type,title,body,url,group_key,read_at,created_at&order=read_at.asc.nullsfirst,created_at.desc&limit=100`).catch(() => []) : [];
+  const [notifications] = await Promise.all([notificationReadPromise, notificationWritePromise]);
   const authenticated = admin || Boolean(playerId);
   const publicEvents = admin ? events : events.map(event => (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) < new Date() ? { ...event, entry_pin: null } : event));
   return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
