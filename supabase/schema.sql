@@ -377,6 +377,7 @@ create table if not exists public.badges (
   description text,
   min_played integer,
   min_wins integer,
+  max_wins integer,
   min_win_pct numeric(5,2),
   min_attendance integer,
   min_point_diff integer,
@@ -391,6 +392,7 @@ create table if not exists public.badges (
   updated_at timestamptz not null default now(),
   constraint badges_fallback_type_check check (fallback_type in ('played','no_played') or fallback_type is null),
   constraint badges_min_win_pct_check check (min_win_pct is null or (min_win_pct >= 0 and min_win_pct <= 100)),
+  constraint badges_max_wins_check check (max_wins is null or (max_wins >= 0 and max_wins <= 100000)),
   constraint badges_min_paid_rate_check check (min_paid_rate is null or (min_paid_rate >= 0 and min_paid_rate <= 100)),
   constraint badges_match_window_check check (match_window is null or (match_window > 0 and match_window <= 100000)),
   constraint badges_attendance_window_check check (attendance_window is null or (attendance_window > 0 and attendance_window <= 100000)),
@@ -398,15 +400,17 @@ create table if not exists public.badges (
 );
 
 insert into public.badges
-  (name, description, min_played, min_wins, min_win_pct, min_attendance, min_point_diff, min_paid_rate, match_window, attendance_window, payment_within_hours, fallback_type, sort_order)
+  (name, description, min_played, min_wins, max_wins, min_win_pct, min_attendance, min_point_diff, min_paid_rate, match_window, attendance_window, payment_within_hours, fallback_type, sort_order)
 values
-  ('Form King', 'Won at least 75% of the most recent five completed matches.', 5, null, 75, null, null, null, 5, null, null, null, 10),
-  ('Regular', 'Attended at least four of the five most recent sessions.', null, null, null, 4, null, null, null, 5, null, null, 20),
-  ('Point Machine', 'A standout positive point differential.', null, null, null, null, 20, null, null, null, null, null, 30),
-  ('Veteran', 'Played more than 50 completed matches.', 51, null, null, null, null, null, null, null, null, null, 40),
-  ('Paid Up Pro', 'Cleared 100% of payments within 24 hours of each session ending.', null, null, null, 1, null, 100, null, null, 24, null, 50),
-  ('Building Form', 'Won at least two of the five most recent completed matches.', 5, 2, null, null, null, null, 5, null, null, null, 90),
-  ('Fresh Legs', 'Played at least one completed match.', 1, null, null, null, null, null, null, null, null, null, 100)
+  ('Form King', 'Won at least 75% of the most recent five completed matches.', 5, null, null, 75, null, null, null, 5, null, null, null, 10),
+  ('Regular', 'Attended at least four of the five most recent sessions.', null, null, null, null, 4, null, null, null, 5, null, null, 20),
+  ('Point Machine', 'A standout positive point differential.', null, null, null, null, null, 20, null, null, null, null, null, 30),
+  ('Veteran', 'Played more than 50 completed matches.', 51, null, null, null, null, null, null, null, null, null, null, 40),
+  ('Paid Up Pro', 'Cleared 100% of payments within 24 hours of each session ending.', null, null, null, null, 1, null, 100, null, null, 24, null, 50),
+  ('Legend', 'Played at least 50 completed matches and has at least a 70% win rate.', 50, null, null, 70, null, null, null, null, null, null, null, 60),
+  ('Disgrace', 'Lost all five of the most recent completed matches.', 5, null, 0, null, null, null, null, 5, null, null, null, 70),
+  ('Building Form', 'Won at least two of the five most recent completed matches.', 5, 2, null, null, null, null, null, 5, null, null, null, 90),
+  ('Fresh Legs', 'Played at least one completed match.', 1, null, null, null, null, null, null, null, null, null, null, 100)
 on conflict (name) do nothing;
 
 -- The browser never connects directly to these tables. Only Netlify Functions
@@ -523,6 +527,20 @@ create index if not exists player_notifications_player_read_created_idx
   on public.player_notifications (player_id, read_at, created_at desc);
 create index if not exists player_notifications_group_idx
   on public.player_notifications (player_id, group_key, created_at desc);
+
+create table if not exists public.player_badge_states (
+  player_id uuid not null references public.players(id) on delete cascade,
+  badge_key text not null,
+  badge_name text not null,
+  rule_version text,
+  active boolean not null default true,
+  updated_at timestamptz not null default now(),
+  primary key (player_id, badge_key)
+);
+alter table public.player_badge_states enable row level security;
+revoke all on public.player_badge_states from anon, authenticated;
+create index if not exists player_badge_states_player_active_idx
+  on public.player_badge_states (player_id, active, updated_at desc);
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('tennis-media', 'tennis-media', false, 52428800, array['image/*','video/*'])

@@ -718,10 +718,11 @@ function badgePayload(body) {
     if (!Number.isFinite(number) || number < 0 || number > max) throw new Error(`${label} must be between 0 and ${max}.`);
     return number;
   };
-  let minPlayed, minWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
+  let minPlayed, minWins, maxWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
   try {
     minPlayed = integer(body.minPlayed, "Minimum matches played");
     minWins = integer(body.minWins, "Minimum wins");
+    maxWins = integer(body.maxWins, "Maximum wins");
     minAttendance = integer(body.minAttendance, "Minimum sessions attended");
     matchWindow = integer(body.matchWindow, "Recent match window", 1);
     attendanceWindow = integer(body.attendanceWindow, "Recent attendance window", 1);
@@ -734,7 +735,7 @@ function badgePayload(body) {
   } catch (error) { return { error: error.message }; }
   const fallbackType = ["played", "no_played"].includes(body.fallbackType) ? body.fallbackType : null;
   const sortOrder = Number.isInteger(Number(body.sortOrder)) ? Math.max(0, Math.min(10000, Number(body.sortOrder))) : 100;
-  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
+  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, max_wins: maxWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
 }
 
 async function saveBadge(body) {
@@ -1652,6 +1653,54 @@ async function markNotificationRead(body, all = false) {
   return reply({ ok: true });
 }
 
+async function syncPlayerBadges(body, req) {
+  const playerId = String(body.playerId || "");
+  if (!playerId) return reply({ error: "Choose your player profile first." }, 400);
+  if (!await isPlayer(req, playerId)) return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
+  const supplied = Array.isArray(body.badges) ? body.badges : [];
+  const current = supplied.map(item => ({
+    key: String(item?.key || item?.name || "").trim().slice(0, 120),
+    name: String(item?.name || "").trim().slice(0, 120),
+    description: String(item?.description || "").trim().slice(0, 240),
+    version: String(item?.version || "").trim().slice(0, 120) || null,
+  })).filter(item => item.key && item.name);
+  let previous;
+  try {
+    previous = await db(`player_badge_states?player_id=eq.${encodeURIComponent(playerId)}&select=*`);
+  } catch (error) {
+    // Older production databases can safely keep running until the optional
+    // badge-state migration is applied; the visual badge UI is unaffected.
+    if (/relation|schema cache|does not exist/i.test(String(error?.message || ""))) return reply({ ok: true, disabled: true, created: 0 });
+    throw error;
+  }
+  const currentByKey = new Map(current.map(item => [item.key, item]));
+  const previousByKey = new Map((previous || []).map(item => [item.badge_key, item]));
+  // First sync establishes a baseline and avoids flooding existing players
+  // with earned-badge notifications after this feature is introduced.
+  if (!previous?.length) {
+    if (current.length) await db("player_badge_states?on_conflict=player_id,badge_key", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(current.map(item => ({ player_id: playerId, badge_key: item.key, badge_name: item.name, rule_version: item.version, active: true, updated_at: new Date().toISOString() }))) });
+    return reply({ ok: true, initialized: true, created: 0 });
+  }
+  const earned = current.filter(item => !previousByKey.get(item.key)?.active);
+  const edited = current.filter(item => { const prior = previousByKey.get(item.key); return prior?.active && item.version && prior.rule_version && item.version !== prior.rule_version; });
+  const removed = (previous || []).filter(item => item.active && !currentByKey.has(item.badge_key));
+  const now = new Date().toISOString();
+  if (current.length) await db("player_badge_states?on_conflict=player_id,badge_key", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(current.map(item => ({ player_id: playerId, badge_key: item.key, badge_name: item.name, rule_version: item.version, active: true, updated_at: now }))) });
+  await Promise.all(removed.map(item => db(`player_badge_states?player_id=eq.${encodeURIComponent(playerId)}&badge_key=eq.${encodeURIComponent(item.badge_key)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ active: false, updated_at: now }) })));
+  const notifications = [
+    ...earned.map(item => ({ item, kind: "earned", title: `New badge earned · ${item.name}`, body: `You’ve earned the ${item.name} badge.${item.description ? ` Criteria: ${item.description}` : ""}`, dedupe_key: `badge-earned:${playerId}:${item.key}:${item.version || "current"}` })),
+    ...edited.map(item => ({ item, kind: "edited", title: `Badge criteria updated · ${item.name}`, body: `The ${item.name} badge criteria changed.${item.description ? ` Current criteria: ${item.description}` : ""}`, dedupe_key: `badge-edited:${playerId}:${item.key}:${item.version}` })),
+    ...removed.map(item => ({ item, kind: "removed", title: `Badge removed · ${item.badge_name}`, body: `Your ${item.badge_name} badge is no longer active because its criteria are no longer met.`, dedupe_key: `badge-removed:${playerId}:${item.badge_key}:${now}` })),
+  ];
+  if (notifications.length) {
+    await createPlayerNotifications(notifications.map(({ item, title, body: message, dedupe_key }) => ({ player_id: playerId, notification_type: "matches", title, body: message, url: "/?page=profiles", dedupe_key })));
+    for (const notification of notifications) {
+      try { await notifyPlayers({ playerIds: [playerId], notificationType: "matches", notificationKey: notification.dedupe_key, title: notification.title, body: notification.body, url: "/?page=profiles", audience: "selected" }); } catch (error) { console.error("Badge notification push failed", error); }
+    }
+  }
+  return reply({ ok: true, initialized: false, created: notifications.length });
+}
+
 async function deleteEvent(body) {
   if (!body.eventId) return reply({ error: "Choose an event to delete." }, 400);
   const event = await getEvent(body.eventId);
@@ -2457,7 +2506,7 @@ export default async (req) => {
     if (req.method === "GET" && action === "realtime-config") return reply({ configured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY), url: SUPABASE_URL || null, anonKey: SUPABASE_ANON_KEY || null });
     if (req.method === "GET" && action === "sync-version") return syncVersion();
 
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "badge-sync", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -2493,6 +2542,7 @@ export default async (req) => {
     if (req.method === "POST" && action === "player-logout-all") return revokePlayerSessions(body);
     if (req.method === "POST" && action === "notification-read") return markNotificationRead(body);
     if (req.method === "POST" && action === "notification-read-all") return markNotificationRead(body, true);
+    if (req.method === "POST" && action === "badge-sync") return syncPlayerBadges(body, req);
     if (req.method === "POST" && action === "admin-login") return adminLogin(body);
     if (req.method === "POST" && action === "admin-place-search") {
       if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
