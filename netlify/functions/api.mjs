@@ -533,6 +533,7 @@ function hydrateEventLocations(events, locations) {
       // Null means “use the linked location default”; an empty string remains
       // an intentional per-event override that hides a PIN.
       entry_pin: event.entry_pin == null ? (linked.entry_pin || null) : event.entry_pin,
+      address: event.address || linked.address || null,
       google_place_id: event.google_place_id || linked.google_place_id || null,
       google_maps_url: event.google_maps_url || placeUrl,
     };
