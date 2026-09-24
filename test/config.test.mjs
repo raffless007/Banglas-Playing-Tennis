@@ -7,6 +7,7 @@ const api = await readFile(new URL("../netlify/functions/api.mjs", import.meta.u
 const sw = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url), "utf8");
 const badgePresets = await readFile(new URL("../supabase/migrations/045_badge_rule_presets.sql", import.meta.url), "utf8");
+const freshLegsMigration = await readFile(new URL("../supabase/migrations/047_fresh_legs_max_matches.sql", import.meta.url), "utf8");
 
 test("security headers and app entry points are present", async () => {
   const netlify = await readFile(new URL("../netlify.toml", import.meta.url), "utf8");
@@ -76,6 +77,15 @@ test("profiles expose every earned badge with lightweight graphics", () => {
   assert.match(index, /badgeCollectionMarkup\(m\)/);
   assert.match(index, /renderAllProfileBadges\(host,id\)/);
   assert.match(index, /renderAllProfileBadges\(\$\('modalContent'\),id\)/);
+});
+
+test("Fresh Legs is limited to one through five matches", () => {
+  assert.match(index, /name:'Fresh Legs'.*min_played:1,max_played:5/s);
+  assert.match(index, /def\.max_played!=null&&m\.played>Number\(def\.max_played\)/);
+  assert.match(api, /max_played: maxPlayed/);
+  assert.match(index, /name="maxPlayed"/);
+  assert.match(freshLegsMigration, /add column if not exists max_played/);
+  assert.match(freshLegsMigration, /max_played = 5/);
 });
 
 test("badge notifications only announce assignments and removals", () => {

@@ -738,9 +738,11 @@ function badgePayload(body) {
     if (!Number.isFinite(number) || number < 0 || number > max) throw new Error(`${label} must be between 0 and ${max}.`);
     return number;
   };
-  let minPlayed, minWins, maxWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
+  let minPlayed, maxPlayed, minWins, maxWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
   try {
     minPlayed = integer(body.minPlayed, "Minimum matches played");
+    maxPlayed = integer(body.maxPlayed, "Maximum matches played");
+    if (minPlayed !== null && maxPlayed !== null && maxPlayed < minPlayed) throw new Error("Maximum matches played must be at least the minimum.");
     minWins = integer(body.minWins, "Minimum wins");
     maxWins = integer(body.maxWins, "Maximum wins");
     minAttendance = integer(body.minAttendance, "Minimum sessions attended");
@@ -755,7 +757,7 @@ function badgePayload(body) {
   } catch (error) { return { error: error.message }; }
   const fallbackType = ["played", "no_played"].includes(body.fallbackType) ? body.fallbackType : null;
   const sortOrder = Number.isInteger(Number(body.sortOrder)) ? Math.max(0, Math.min(10000, Number(body.sortOrder))) : 100;
-  return { value: { name, description: description || null, min_played: minPlayed, min_wins: minWins, max_wins: maxWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
+  return { value: { name, description: description || null, min_played: minPlayed, max_played: maxPlayed, min_wins: minWins, max_wins: maxWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
 }
 
 async function saveBadge(body) {

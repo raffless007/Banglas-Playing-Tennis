@@ -376,6 +376,7 @@ create table if not exists public.badges (
   name text not null unique,
   description text,
   min_played integer,
+  max_played integer,
   min_wins integer,
   max_wins integer,
   min_win_pct numeric(5,2),
@@ -392,6 +393,7 @@ create table if not exists public.badges (
   updated_at timestamptz not null default now(),
   constraint badges_fallback_type_check check (fallback_type in ('played','no_played') or fallback_type is null),
   constraint badges_min_win_pct_check check (min_win_pct is null or (min_win_pct >= 0 and min_win_pct <= 100)),
+  constraint badges_max_played_check check (max_played is null or (max_played >= 0 and max_played <= 100000)),
   constraint badges_max_wins_check check (max_wins is null or (max_wins >= 0 and max_wins <= 100000)),
   constraint badges_min_paid_rate_check check (min_paid_rate is null or (min_paid_rate >= 0 and min_paid_rate <= 100)),
   constraint badges_match_window_check check (match_window is null or (match_window > 0 and match_window <= 100000)),
@@ -412,6 +414,11 @@ values
   ('Building Form', 'Won at least two of the five most recent completed matches.', 5, 2, null, null, null, null, null, 5, null, null, null, 90),
   ('Fresh Legs', 'Played at least one completed match.', 1, null, null, null, null, null, null, null, null, null, null, 100)
 on conflict (name) do nothing;
+
+update public.badges
+set description = 'Played between one and five completed matches.', min_played = 1, max_played = 5,
+    fallback_type = null, enabled = true, updated_at = now()
+where name = 'Fresh Legs';
 
 -- The browser never connects directly to these tables. Only Netlify Functions
 -- use the server-side service-role key, so exposed-table access stays closed.
