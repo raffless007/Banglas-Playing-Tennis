@@ -63,6 +63,13 @@ test("badge rules support recent samples, payment deadlines, and editable maximu
   assert.match(badgePresets, /payment_within_hours = 24/);
 });
 
+test("Form King supersedes Building Form", () => {
+  assert.match(index, /formKingQualified=qualified\.some\(def=>def\.name==='Form King'\)/);
+  assert.match(index, /def\.name==='Building Form'/);
+  assert.match(index, /description:'Won at least 40% of the most recent five completed matches.'/);
+  assert.match(index, /min_win_pct:40,match_window:5/);
+});
+
 test("badge notifications only announce assignments and removals", () => {
   assert.match(api, /New badge earned/);
   assert.match(api, /Badge removed/);
