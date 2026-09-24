@@ -8,6 +8,7 @@ const sw = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url), "utf8");
 const badgePresets = await readFile(new URL("../supabase/migrations/045_badge_rule_presets.sql", import.meta.url), "utf8");
 const freshLegsMigration = await readFile(new URL("../supabase/migrations/047_fresh_legs_max_matches.sql", import.meta.url), "utf8");
+const badgeRangesMigration = await readFile(new URL("../supabase/migrations/048_badge_criteria_ranges.sql", import.meta.url), "utf8");
 
 test("security headers and app entry points are present", async () => {
   const netlify = await readFile(new URL("../netlify.toml", import.meta.url), "utf8");
@@ -86,6 +87,22 @@ test("Fresh Legs is limited to one through five matches", () => {
   assert.match(index, /name="maxPlayed"/);
   assert.match(freshLegsMigration, /add column if not exists max_played/);
   assert.match(freshLegsMigration, /max_played = 5/);
+});
+
+test("badge editor groups optional minimum and maximum ranges", () => {
+  assert.match(index, /<legend>Matches<\/legend>/);
+  assert.match(index, /<legend>Win rate<\/legend>/);
+  assert.match(index, /<legend>Sessions<\/legend>/);
+  assert.match(index, /<legend>Point differential<\/legend>/);
+  assert.match(index, /'maxWinPct'/);
+  assert.match(index, /'maxAttendance'/);
+  assert.match(index, /'maxPointDiff'/);
+  assert.match(index, /'maxPaidRate'/);
+  assert.match(api, /max_win_pct: maxWinPct/);
+  assert.match(api, /max_attendance: maxAttendance/);
+  assert.match(api, /max_point_diff: maxPointDiff/);
+  assert.match(api, /max_paid_rate: maxPaidRate/);
+  assert.match(badgeRangesMigration, /add column if not exists max_win_pct/);
 });
 
 test("badge notifications only announce assignments and removals", () => {

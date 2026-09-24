@@ -738,26 +738,36 @@ function badgePayload(body) {
     if (!Number.isFinite(number) || number < 0 || number > max) throw new Error(`${label} must be between 0 and ${max}.`);
     return number;
   };
-  let minPlayed, maxPlayed, minWins, maxWins, minAttendance, minPointDiff, minWinPct, minPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
+  let minPlayed, maxPlayed, minWins, maxWins, minAttendance, maxAttendance, minPointDiff, maxPointDiff, minWinPct, maxWinPct, minPaidRate, maxPaidRate, matchWindow, attendanceWindow, paymentWithinHours;
   try {
     minPlayed = integer(body.minPlayed, "Minimum matches played");
     maxPlayed = integer(body.maxPlayed, "Maximum matches played");
     if (minPlayed !== null && maxPlayed !== null && maxPlayed < minPlayed) throw new Error("Maximum matches played must be at least the minimum.");
     minWins = integer(body.minWins, "Minimum wins");
     maxWins = integer(body.maxWins, "Maximum wins");
+    if (minWins !== null && maxWins !== null && maxWins < minWins) throw new Error("Maximum wins must be at least the minimum.");
     minAttendance = integer(body.minAttendance, "Minimum sessions attended");
+    maxAttendance = integer(body.maxAttendance, "Maximum sessions attended");
+    if (minAttendance !== null && maxAttendance !== null && maxAttendance < minAttendance) throw new Error("Maximum sessions attended must be at least the minimum.");
     matchWindow = integer(body.matchWindow, "Recent match window", 1);
     attendanceWindow = integer(body.attendanceWindow, "Recent attendance window", 1);
     paymentWithinHours = decimal(body.paymentWithinHours, "Payment completion window", 720);
     if (paymentWithinHours !== null && paymentWithinHours <= 0) throw new Error("Payment completion window must be greater than 0 hours.");
     minPointDiff = body.minPointDiff === "" || body.minPointDiff === null || body.minPointDiff === undefined ? null : Number(body.minPointDiff);
     if (minPointDiff !== null && (!Number.isInteger(minPointDiff) || minPointDiff < -100000 || minPointDiff > 100000)) throw new Error("Minimum point differential must be a whole number.");
+    maxPointDiff = body.maxPointDiff === "" || body.maxPointDiff === null || body.maxPointDiff === undefined ? null : Number(body.maxPointDiff);
+    if (maxPointDiff !== null && (!Number.isInteger(maxPointDiff) || maxPointDiff < -100000 || maxPointDiff > 100000)) throw new Error("Maximum point differential must be a whole number.");
+    if (minPointDiff !== null && maxPointDiff !== null && maxPointDiff < minPointDiff) throw new Error("Maximum point differential must be at least the minimum.");
     minWinPct = decimal(body.minWinPct, "Minimum win percentage");
+    maxWinPct = decimal(body.maxWinPct, "Maximum win percentage");
+    if (minWinPct !== null && maxWinPct !== null && maxWinPct < minWinPct) throw new Error("Maximum win percentage must be at least the minimum.");
     minPaidRate = decimal(body.minPaidRate, "Minimum payment completion percentage");
+    maxPaidRate = decimal(body.maxPaidRate, "Maximum payment completion percentage");
+    if (minPaidRate !== null && maxPaidRate !== null && maxPaidRate < minPaidRate) throw new Error("Maximum payment completion percentage must be at least the minimum.");
   } catch (error) { return { error: error.message }; }
   const fallbackType = ["played", "no_played"].includes(body.fallbackType) ? body.fallbackType : null;
   const sortOrder = Number.isInteger(Number(body.sortOrder)) ? Math.max(0, Math.min(10000, Number(body.sortOrder))) : 100;
-  return { value: { name, description: description || null, min_played: minPlayed, max_played: maxPlayed, min_wins: minWins, max_wins: maxWins, min_win_pct: minWinPct, min_attendance: minAttendance, min_point_diff: minPointDiff, min_paid_rate: minPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
+  return { value: { name, description: description || null, min_played: minPlayed, max_played: maxPlayed, min_wins: minWins, max_wins: maxWins, min_win_pct: minWinPct, max_win_pct: maxWinPct, min_attendance: minAttendance, max_attendance: maxAttendance, min_point_diff: minPointDiff, max_point_diff: maxPointDiff, min_paid_rate: minPaidRate, max_paid_rate: maxPaidRate, match_window: matchWindow, attendance_window: attendanceWindow, payment_within_hours: paymentWithinHours, fallback_type: fallbackType, enabled: body.enabled !== false, sort_order: sortOrder, updated_at: new Date().toISOString() } };
 }
 
 async function saveBadge(body) {
