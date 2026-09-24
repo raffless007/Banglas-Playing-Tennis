@@ -70,6 +70,14 @@ test("Form King supersedes Building Form", () => {
   assert.match(index, /min_win_pct:40,match_window:5/);
 });
 
+test("profiles expose every earned badge with lightweight graphics", () => {
+  assert.match(index, /row\.allBadges=playerBadges\(row,true\)/);
+  assert.match(index, /BADGE_GRAPHICS/);
+  assert.match(index, /badgeCollectionMarkup\(m\)/);
+  assert.match(index, /renderAllProfileBadges\(host,id\)/);
+  assert.match(index, /renderAllProfileBadges\(\$\('modalContent'\),id\)/);
+});
+
 test("badge notifications only announce assignments and removals", () => {
   assert.match(api, /New badge earned/);
   assert.match(api, /Badge removed/);
