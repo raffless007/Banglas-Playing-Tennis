@@ -1703,14 +1703,12 @@ async function syncPlayerBadges(body, req) {
     return reply({ ok: true, initialized: true, created: 0 });
   }
   const earned = current.filter(item => !previousByKey.get(item.key)?.active);
-  const edited = current.filter(item => { const prior = previousByKey.get(item.key); return prior?.active && item.version && prior.rule_version && item.version !== prior.rule_version; });
   const removed = (previous || []).filter(item => item.active && !currentByKey.has(item.badge_key));
   const now = new Date().toISOString();
   if (current.length) await db("player_badge_states?on_conflict=player_id,badge_key", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(current.map(item => ({ player_id: playerId, badge_key: item.key, badge_name: item.name, rule_version: item.version, active: true, updated_at: now }))) });
   await Promise.all(removed.map(item => db(`player_badge_states?player_id=eq.${encodeURIComponent(playerId)}&badge_key=eq.${encodeURIComponent(item.badge_key)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ active: false, updated_at: now }) })));
   const notifications = [
     ...earned.map(item => ({ item, kind: "earned", title: `New badge earned · ${item.name}`, body: `You’ve earned the ${item.name} badge.${item.description ? ` Criteria: ${item.description}` : ""}`, dedupe_key: `badge-earned:${playerId}:${item.key}:${item.version || "current"}` })),
-    ...edited.map(item => ({ item, kind: "edited", title: `Badge criteria updated · ${item.name}`, body: `The ${item.name} badge criteria changed.${item.description ? ` Current criteria: ${item.description}` : ""}`, dedupe_key: `badge-edited:${playerId}:${item.key}:${item.version}` })),
     ...removed.map(item => ({ item, kind: "removed", title: `Badge removed · ${item.badge_name}`, body: `Your ${item.badge_name} badge is no longer active because its criteria are no longer met.`, dedupe_key: `badge-removed:${playerId}:${item.badge_key}:${now}` })),
   ];
   if (notifications.length) {

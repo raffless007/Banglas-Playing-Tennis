@@ -63,6 +63,13 @@ test("badge rules support recent samples, payment deadlines, and editable maximu
   assert.match(badgePresets, /payment_within_hours = 24/);
 });
 
+test("badge notifications only announce assignments and removals", () => {
+  assert.match(api, /New badge earned/);
+  assert.match(api, /Badge removed/);
+  assert.doesNotMatch(api, /Badge criteria updated/);
+  assert.doesNotMatch(api, /badge-edited:/);
+});
+
 test("the inline app script remains valid JavaScript", () => {
   const inlineScripts = [...index.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
     .map((match) => match[1])
