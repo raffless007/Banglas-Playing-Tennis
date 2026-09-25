@@ -98,6 +98,7 @@ test("badge editor groups optional minimum and maximum ranges", () => {
   assert.match(index, /'maxAttendance'/);
   assert.match(index, /'maxPointDiff'/);
   assert.match(index, /'maxPaidRate'/);
+  assert.match(index, /sortOrder:'sort_order'.*minPlayed:'min_played'.*maxPaidRate:'max_paid_rate'/);
   assert.match(api, /max_win_pct: maxWinPct/);
   assert.match(api, /max_attendance: maxAttendance/);
   assert.match(api, /max_point_diff: maxPointDiff/);
