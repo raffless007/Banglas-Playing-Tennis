@@ -615,7 +615,10 @@ async function appState(req) {
   })));
   const visiblePayments = payments.map(payment => {
     if (admin || payment.player_id === playerId) return payment;
-    return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid };
+    // Payment timestamps are intentionally visible to every authenticated
+    // player so the live tracker is transparent. Keep the payment amount
+    // private for other players; the UI calculates the shared amount itself.
+    return { event_id: payment.event_id, player_id: payment.player_id, paid: !!payment.paid, paid_at: payment.paid_at || null };
   });
   let notifications = [];
   if (playerId) {

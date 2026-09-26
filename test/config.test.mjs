@@ -50,6 +50,11 @@ test("high-risk production constants are not accidentally reduced", () => {
   assert.match(api, /SCORING_WINDOW_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
 });
 
+test("authenticated players can see payment timestamps for everyone", () => {
+  assert.match(api, /paid_at: payment\.paid_at \|\| null/);
+  assert.match(index, /paid\?paidStamp\(row\?\.paid_at\):'—'/);
+});
+
 test("badge rules support recent samples, payment deadlines, and editable maximum wins", () => {
   assert.match(index, /matchWindow\?m\.recentMatches\.slice\(0,matchWindow\):m\.recentMatches/);
   assert.match(index, /attendanceWindow\?m\.completedEvents\.slice\(0,attendanceWindow\):m\.attendanceEvents/);
