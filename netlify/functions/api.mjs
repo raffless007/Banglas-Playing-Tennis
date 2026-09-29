@@ -1402,7 +1402,8 @@ async function undoLivePoint(body, adminOverride = false) {
 async function abandonLiveMatch(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
-  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
+  if (!body.playerId) return reply({ error: "Live match not found." }, 404);
+  if (!match) return reply({ ok: true, matchId: body.matchId, alreadyAbandoned: true });
   const event = await getEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
