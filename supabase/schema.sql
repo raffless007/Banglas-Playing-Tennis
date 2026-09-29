@@ -179,6 +179,8 @@ create table if not exists public.payments (
 create table if not exists public.match_scores (
   id uuid primary key default gen_random_uuid(),
   event_id uuid not null references public.events(id) on delete cascade,
+  match_type text not null default 'doubles' check (match_type in ('doubles','singles')),
+  games_to_win integer not null default 4 check (games_to_win in (2,4)),
   team_a_player_ids uuid[] not null,
   team_b_player_ids uuid[] not null,
   games_a integer not null check (games_a between 0 and 4),
@@ -194,13 +196,16 @@ create table if not exists public.match_scores (
   duration_seconds integer,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  check (cardinality(team_a_player_ids) = 2),
-  check (cardinality(team_b_player_ids) = 2)
+  check (cardinality(team_a_player_ids) between 1 and 2),
+  check (cardinality(team_b_player_ids) between 1 and 2),
+  check ((match_type = 'singles' and cardinality(team_a_player_ids) = 1 and cardinality(team_b_player_ids) = 1) or (match_type = 'doubles' and games_to_win = 4 and cardinality(team_a_player_ids) = 2 and cardinality(team_b_player_ids) = 2))
 );
 
 create table if not exists public.live_matches (
   id uuid primary key default gen_random_uuid(),
   event_id uuid not null references public.events(id) on delete cascade,
+  match_type text not null default 'doubles' check (match_type in ('doubles','singles')),
+  games_to_win integer not null default 4 check (games_to_win in (2,4)),
   team_a_player_ids uuid[] not null,
   team_b_player_ids uuid[] not null,
   server_player_id uuid references public.players(id),
@@ -225,8 +230,9 @@ create table if not exists public.live_matches (
   created_by uuid not null references public.players(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  check (cardinality(team_a_player_ids) = 2),
-  check (cardinality(team_b_player_ids) = 2)
+  check (cardinality(team_a_player_ids) between 1 and 2),
+  check (cardinality(team_b_player_ids) between 1 and 2),
+  check ((match_type = 'singles' and cardinality(team_a_player_ids) = 1 and cardinality(team_b_player_ids) = 1) or (match_type = 'doubles' and games_to_win = 4 and cardinality(team_a_player_ids) = 2 and cardinality(team_b_player_ids) = 2))
 );
 
 alter table public.match_scores

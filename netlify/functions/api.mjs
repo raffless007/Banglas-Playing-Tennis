@@ -1098,13 +1098,18 @@ async function markPaid(body) {
   return reply({ ok: true, amount });
 }
 
-function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB) {
-  if (![gamesA, gamesB].every(value => Number.isInteger(value) && value >= 0 && value <= 4)) return { valid: false };
-  const regular = (gamesA === 4 && gamesB <= 2) || (gamesB === 4 && gamesA <= 2);
+function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) {
+  const target = Number(gamesToWin) === 2 ? 2 : 4;
+  if (![gamesA, gamesB].every(value => Number.isInteger(value) && value >= 0 && value <= target + 1)) return { valid: false };
+  const regular = target === 2
+    ? ((gamesA === 2 && gamesB === 0) || (gamesB === 2 && gamesA === 0) || (gamesA === 3 && gamesB === 1) || (gamesB === 3 && gamesA === 1))
+    : ((gamesA === 4 && gamesB <= 2) || (gamesB === 4 && gamesA <= 2));
   if (regular) return { valid: true, tiebreakA: null, tiebreakB: null };
-  const tiebreakSet = (gamesA === 4 && gamesB === 3) || (gamesB === 4 && gamesA === 3);
+  const tiebreakSet = target === 2
+    ? gamesA === 2 && gamesB === 2
+    : (gamesA === 4 && gamesB === 3) || (gamesB === 4 && gamesA === 3);
   if (!tiebreakSet || !Number.isInteger(tiebreakA) || !Number.isInteger(tiebreakB)) return { valid: false };
-  const aWon = gamesA === 4;
+  const aWon = target === 2 ? tiebreakA > tiebreakB : gamesA === 4;
   const winningPoints = aWon ? tiebreakA : tiebreakB;
   const losingPoints = aWon ? tiebreakB : tiebreakA;
   const valid = losingPoints >= 0 && winningPoints >= 5 && winningPoints - losingPoints >= 2;
@@ -1122,6 +1127,7 @@ async function attendingSet(eventId, playerId) {
 
 function liveSnapshot(match) {
   return {
+    games_to_win: Number(match.games_to_win || 4),
     server_player_id: match.server_player_id,
     server_order: match.server_order || [],
     server_index: Number(match.server_index || 0),
@@ -1144,6 +1150,10 @@ function liveHistory(match) {
 }
 
 function buildServerOrder(teamA, teamB, teamAServerId, teamBServerId) {
+  if (teamA.length === 1 && teamB.length === 1) {
+    const first = teamA.includes(teamAServerId) ? teamAServerId : teamB.includes(teamBServerId) ? teamBServerId : teamA[0];
+    return [first, first === teamA[0] ? teamB[0] : teamA[0]].filter(Boolean);
+  }
   const aFirst = teamA.includes(teamAServerId) ? teamAServerId : teamA[0];
   const bFirst = teamB.includes(teamBServerId) ? teamBServerId : teamB[0];
   return [aFirst, bFirst, teamA.find(id => id !== aFirst), teamB.find(id => id !== bFirst)].filter(Boolean);
@@ -1158,6 +1168,7 @@ function nextServer(match) {
 
 function liveAdvance(match, winner) {
   const next = { ...match };
+  const target = Number(next.games_to_win || 4) === 2 ? 2 : 4;
   let gameFinished = false;
   if (next.completed) return next;
   if (winner === "a") next.points_a++;
@@ -1166,10 +1177,10 @@ function liveAdvance(match, winner) {
     if (winner === "a") next.tiebreak_a++;
     else next.tiebreak_b++;
     if (next.tiebreak_a >= 5 && next.tiebreak_a - next.tiebreak_b >= 2) {
-      next.games_a = 4; next.completed = true;
+      next.games_a = target === 2 ? 2 : 4; next.completed = true;
     }
     if (next.tiebreak_b >= 5 && next.tiebreak_b - next.tiebreak_a >= 2) {
-      next.games_b = 4; next.completed = true;
+      next.games_b = target === 2 ? 2 : 4; next.completed = true;
     }
     // Tie-break serving: the natural next server serves one point, then
     // serving changes every two points. The player shown is always the server
@@ -1193,14 +1204,19 @@ function liveAdvance(match, winner) {
   if (next.point_b >= 4 && next.point_b - next.point_a >= 2) {
     next.games_b++; next.point_a = 0; next.point_b = 0; gameFinished = true;
   }
-  if (next.games_a >= 4 && next.games_a - next.games_b >= 2) next.completed = true;
-  if (next.games_b >= 4 && next.games_b - next.games_a >= 2) next.completed = true;
+  if (target === 2) {
+    if ((next.games_a === 2 && next.games_b === 0) || (next.games_a === 3 && next.games_b === 1)) next.completed = true;
+    if ((next.games_b === 2 && next.games_a === 0) || (next.games_b === 3 && next.games_a === 1)) next.completed = true;
+  } else {
+    if (next.games_a >= 4 && next.games_a - next.games_b >= 2) next.completed = true;
+    if (next.games_b >= 4 && next.games_b - next.games_a >= 2) next.completed = true;
+  }
   if (gameFinished && !next.completed) {
     const server = nextServer(next);
     next.server_index = server.serverIndex;
     next.server_player_id = server.serverId;
   }
-  if (next.games_a === 3 && next.games_b === 3) next.is_tiebreak = true;
+  if ((target === 2 && next.games_a === 2 && next.games_b === 2) || (target === 4 && next.games_a === 3 && next.games_b === 3)) next.is_tiebreak = true;
   next.needs_server_choice = false;
   next.game_finished = gameFinished;
   return next;
@@ -1215,19 +1231,23 @@ async function startLiveMatch(body, adminOverride = false) {
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   const active = await db(`live_matches?event_id=eq.${encodeURIComponent(body.eventId)}&completed=eq.false&select=id`);
   if (active.length) return reply({ error: "Finish or abandon the current live match first." }, 409);
+  const matchType = body.matchType === "singles" ? "singles" : "doubles";
+  const gamesToWin = matchType === "singles" && Number(body.gamesToWin) === 2 ? 2 : 4;
   const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
   const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
   const allPlayers = [...teamA, ...teamB];
-  if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4 || (!adminOverride && allPlayers.some(id => !attending.has(id)))) {
-    return reply({ error: "Choose four different players from this week’s In list." }, 400);
+  const requiredCount = matchType === "singles" ? 1 : 2;
+  if (teamA.length !== requiredCount || teamB.length !== requiredCount || new Set(allPlayers).size !== requiredCount * 2 || (!adminOverride && allPlayers.some(id => !attending.has(id)))) {
+    return reply({ error: matchType === "singles" ? "Choose two different players from this week’s In list." : "Choose four different players from this week’s In list." }, 400);
   }
   const teamAServerId = body.teamAServerId || body.serverPlayerId;
   const teamBServerId = body.teamBServerId;
-  if (!teamA.includes(teamAServerId)) return reply({ error: "Choose Team 1’s first server." }, 400);
-  if (!teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
+  if (matchType === "singles" && !allPlayers.includes(teamAServerId)) return reply({ error: "Choose one of the Singles players as the first server." }, 400);
+  if (matchType === "doubles" && !teamA.includes(teamAServerId)) return reply({ error: "Choose Team 1’s first server." }, 400);
+  if (matchType === "doubles" && !teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
   const serverOrder = buildServerOrder(teamA, teamB, teamAServerId, teamBServerId);
   let created;
-  const createdPayload = { event_id: body.eventId, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), started_at: new Date().toISOString() };
+  const createdPayload = { event_id: body.eventId, match_type: matchType, games_to_win: gamesToWin, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), started_at: new Date().toISOString() };
   try {
     created = await db("live_matches?select=*", {
       method: "POST",
@@ -1451,6 +1471,8 @@ async function finishLiveMatch(body, adminOverride = false) {
       headers: { Prefer: "return=representation" },
       body: JSON.stringify({
         event_id: match.event_id,
+        match_type: match.match_type === "singles" ? "singles" : "doubles",
+        games_to_win: Number(match.games_to_win) === 2 && match.match_type === "singles" ? 2 : 4,
         team_a_player_ids: match.team_a_player_ids,
         team_b_player_ids: match.team_b_player_ids,
         games_a: match.games_a,
@@ -1487,20 +1509,25 @@ async function submitScore(body) {
   if (!matches.length) return reply({ error: "Add at least one match." }, 400);
   const inserts = [];
   for (const match of matches) {
+    const matchType = match.matchType === "singles" ? "singles" : "doubles";
+    const gamesToWin = matchType === "singles" && Number(match.gamesToWin) === 2 ? 2 : 4;
     const teamA = Array.isArray(match.teamA) ? match.teamA.filter(Boolean) : [];
     const teamB = Array.isArray(match.teamB) ? match.teamB.filter(Boolean) : [];
     const allPlayers = [...teamA, ...teamB];
-    if (teamA.length !== 2 || teamB.length !== 2) return reply({ error: "Every doubles match requires exactly two players on each team." }, 400);
-    if (new Set(allPlayers).size !== 4 || allPlayers.some(id => !attending.has(id))) {
-      return reply({ error: "Each match must contain four different players from the final In list." }, 400);
+    const requiredCount = matchType === "singles" ? 1 : 2;
+    if (teamA.length !== requiredCount || teamB.length !== requiredCount) return reply({ error: matchType === "singles" ? "Every singles match requires one player on each side." : "Every doubles match requires exactly two players on each team." }, 400);
+    if (new Set(allPlayers).size !== requiredCount * 2 || allPlayers.some(id => !attending.has(id))) {
+      return reply({ error: matchType === "singles" ? "Each singles match must contain two different players from the final In list." : "Each match must contain four different players from the final In list." }, 400);
     }
     const gamesA = Number(match.gamesA), gamesB = Number(match.gamesB);
     const tiebreakA = match.tiebreakA === "" || match.tiebreakA == null ? null : Number(match.tiebreakA);
     const tiebreakB = match.tiebreakB === "" || match.tiebreakB == null ? null : Number(match.tiebreakB);
-    const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB);
-    if (!checked.valid) return reply({ error: "Every score must be 4–0, 4–1, 4–2, or 4–3 with a valid race-to-5 tie-break won by two points." }, 400);
+    const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
+    if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Singles race-to-2 scores must be 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Every score must be 4–0, 4–1, 4–2, or 4–3 with a valid race-to-5 tie-break won by two points." }, 400);
     inserts.push({
       event_id: body.eventId,
+      match_type: matchType,
+      games_to_win: gamesToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
       games_a: gamesA,
@@ -2102,13 +2129,16 @@ async function adminDeleteScore(body) {
 
 async function adminUpdateScore(body) {
   if (!body.scoreId) return reply({ error: "Score not found." }, 404);
-  const rows = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=id`);
+  const rows = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=id,match_type,games_to_win`);
   if (!rows?.length) return reply({ error: "Score not found." }, 404);
+  const matchType = body.matchType === "singles" || (body.matchType == null && rows[0].match_type === "singles") ? "singles" : "doubles";
+  const gamesToWin = matchType === "singles" && Number(body.gamesToWin ?? rows[0].games_to_win) === 2 ? 2 : 4;
   const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
   const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
   const allPlayers = [...teamA, ...teamB];
-  if (teamA.length !== 2 || teamB.length !== 2 || new Set(allPlayers).size !== 4) {
-    return reply({ error: "Every doubles match needs four different players." }, 400);
+  const requiredCount = matchType === "singles" ? 1 : 2;
+  if (teamA.length !== requiredCount || teamB.length !== requiredCount || new Set(allPlayers).size !== requiredCount * 2) {
+    return reply({ error: matchType === "singles" ? "Every singles match needs two different players." : "Every doubles match needs four different players." }, 400);
   }
   const players = await db("players?select=id");
   const rosterIds = new Set(players.map(player => player.id));
@@ -2116,14 +2146,16 @@ async function adminUpdateScore(body) {
   const gamesA = Number(body.gamesA), gamesB = Number(body.gamesB);
   const tiebreakA = body.tiebreakA === "" || body.tiebreakA == null ? null : Number(body.tiebreakA);
   const tiebreakB = body.tiebreakB === "" || body.tiebreakB == null ? null : Number(body.tiebreakB);
-  const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB);
-  if (!checked.valid) return reply({ error: "Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-5 tie-break won by two." }, 400);
+  const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
+  if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Use a Singles race-to-2 score: 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-5 tie-break won by two." }, 400);
   const pointsA = Math.max(0, Math.trunc(Number(body.pointsA) || 0));
   const pointsB = Math.max(0, Math.trunc(Number(body.pointsB) || 0));
   const updated = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify({
+      match_type: matchType,
+      games_to_win: gamesToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
       games_a: gamesA,
