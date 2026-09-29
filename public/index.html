@@ -232,7 +232,7 @@
     function scoringClosesFor(e){return new Date(eventMoment(e,endTime(e)).getTime()+24*3600000)}
     function scoringOpenFor(e){const now=new Date();return now>=eventMoment(e,startTime(e))&&now<=scoringClosesFor(e)}
     function scoringWindowText(e){const now=new Date();if(now<eventMoment(e,startTime(e)))return`Scoring opens at ${startTime(e).slice(0,5)} on match day.`;if(now>scoringClosesFor(e))return`Scoring closed ${fmt(scoringClosesFor(e),{weekday:'short',hour:'numeric',minute:'2-digit'})}.`;return`Scoring closes ${fmt(scoringClosesFor(e),{weekday:'short',hour:'numeric',minute:'2-digit'})}.`}
-    const PLAYER_SESSION_IDLE_MS=15*60*1000,ADMIN_SESSION_IDLE_MS=10*60*1000,SESSION_WARNING_MS=60*1000,PLAYER_ACTIVITY_KEY='bpt-player-last-activity',ADMIN_ACTIVITY_KEY='bpt-admin-last-activity';
+    const PLAYER_SESSION_IDLE_MS=24*60*60*1000,ADMIN_SESSION_IDLE_MS=60*60*1000,SESSION_WARNING_MS=60*1000,PLAYER_ACTIVITY_KEY='bpt-player-last-activity',ADMIN_ACTIVITY_KEY='bpt-admin-last-activity';
     function sessionTokenIssuedAt(token){try{const encoded=String(token||'').split('.')[0];if(!encoded)return 0;const padded=encoded.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-encoded.length%4)%4),payload=JSON.parse(atob(padded));return Number(payload.iat)||Math.max(0,Number(payload.exp||0)-8*60*60*1000)}catch{return 0}}
     let sessionTimer=null,playerLastActivity=Number(localStorage.getItem(PLAYER_ACTIVITY_KEY))||sessionTokenIssuedAt(playerToken)||Date.now(),adminLastActivity=Number(sessionStorage.getItem(ADMIN_ACTIVITY_KEY))||sessionTokenIssuedAt(adminToken)||Date.now(),sessionActivityTick=0,sessionWarnings={player:false,admin:false};
     function activeSessionType(){return adminToken?'admin':playerToken?'player':null}
