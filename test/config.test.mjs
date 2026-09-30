@@ -118,6 +118,12 @@ test("badge notifications only announce assignments and removals", () => {
   assert.doesNotMatch(api, /badge-edited:/);
 });
 
+test("payment-timed badges wait for the full deadline before evaluating", () => {
+  assert.match(index, /paymentWindowPending/);
+  assert.match(index, /persisted[\s\S]*badge state untouched/);
+  assert.match(index, /paymentRateWithin=hours=>[\s\S]*row\.paymentWindowPending\(cutoff\)\)return null/);
+});
+
 test("the inline app script remains valid JavaScript", () => {
   const inlineScripts = [...index.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
     .map((match) => match[1])

@@ -266,7 +266,12 @@
     async function syncBadgeNotifications(){
       if(!currentPlayerId||!playerToken)return;
       const definitions=data.badges?.length?data.badges:defaultBadgeDefinitions();
-      const metrics=playerMetrics(currentPlayerId),earned=new Set(playerBadges(metrics,true));
+      const metrics=playerMetrics(currentPlayerId);
+      // Payment-timed badges must not transition while the latest attended
+      // session is still inside its payment deadline. Keep the persisted
+      // badge state untouched until the outcome can be assessed.
+      if(definitions.some(def=>def.enabled!==false&&def.payment_within_hours!=null&&metrics.paymentWindowPending(Number(def.payment_within_hours))))return;
+      const earned=new Set(playerBadges(metrics,true));
       const current=definitions.filter(def=>def.enabled!==false&&earned.has(def.name)).map(def=>({key:String(def.id||def.name),name:def.name,description:def.description||'',version:String(def.updated_at||def.created_at||'default')})).sort((a,b)=>a.key.localeCompare(b.key));
       const storageKey=`bpt-badge-state:${currentPlayerId}`,signature=JSON.stringify(current.map(item=>[item.key,item.version]));
       if(localStorage.getItem(storageKey)===signature)return;
@@ -351,7 +356,7 @@
     // These declarations intentionally sit after the legacy implementations so
     // the upgraded evaluator is used without changing any event bindings.
     function playerMetrics(id){
-      const completed=completedEventIds(),completedEvents=[...data.events].filter(e=>completed.has(e.id)&&e.cancellation_status!=='cancelled').sort((a,b)=>eventEndTimestamp(b)-eventEndTimestamp(a)),eventsById=new Map(completedEvents.map(e=>[e.id,e])),attendanceEvents=completedEvents.filter(e=>{const response=eoi(e.id,id);return response?.status==='yes'&&response.attendance_status!=='no_show'});
+      const now=Date.now(),completed=completedEventIds(),completedEvents=[...data.events].filter(e=>completed.has(e.id)&&e.cancellation_status!=='cancelled').sort((a,b)=>eventEndTimestamp(b)-eventEndTimestamp(a)),eventsById=new Map(completedEvents.map(e=>[e.id,e])),attendanceEvents=completedEvents.filter(e=>{const response=eoi(e.id,id);return response?.status==='yes'&&response.attendance_status!=='no_show'}),inProgressAttendanceEvents=data.events.filter(e=>e.cancellation_status!=='cancelled'&&eventMoment(e,startTime(e)).getTime()<=now&&eventEndTimestamp(e)>now&&(()=>{const response=eoi(e.id,id);return response?.status==='yes'&&response.attendance_status!=='no_show'})());
       const row={id,name:playerName(id),played:0,wins:0,losses:0,pointsFor:0,pointsAgainst:0,attendance:attendanceEvents.length,paid:0,partners:new Map(),recent:[],attendanceEvents,completedEvents};
       for(const s of data.scores||[]){
         if(!completed.has(s.event_id))continue;
@@ -364,7 +369,8 @@
       row.paidEvents=attendanceEvents.map(event=>({event,payment:data.payments.find(payment=>payment.event_id===event.id&&payment.player_id===id)}));
       row.paid=row.paidEvents.filter(item=>item.payment?.paid).length;
       row.paymentRate=row.attendance?row.paid/row.attendance*100:0;
-      row.paymentRateWithin=hours=>{const cutoff=Number(hours);if(!row.paidEvents.length||!Number.isFinite(cutoff)||cutoff<=0)return 0;const paidWithin=row.paidEvents.filter(({event,payment})=>{if(!payment?.paid||!payment.paid_at)return false;const paidAt=Date.parse(payment.paid_at),end=eventEndTimestamp(event);return Number.isFinite(paidAt)&&paidAt<=end+cutoff*3600000}).length;return paidWithin/row.paidEvents.length*100};
+      row.paymentWindowPending=hours=>{const cutoff=Number(hours);if(!Number.isFinite(cutoff)||cutoff<=0)return false;const pendingEvents=[...row.paidEvents.map(item=>item.event),...inProgressAttendanceEvents];return pendingEvents.some(event=>eventEndTimestamp(event)+cutoff*3600000>now)};
+      row.paymentRateWithin=hours=>{const cutoff=Number(hours);if(!row.paidEvents.length||!Number.isFinite(cutoff)||cutoff<=0||row.paymentWindowPending(cutoff))return null;const paidWithin=row.paidEvents.filter(({event,payment})=>{if(!payment?.paid||!payment.paid_at)return false;const paidAt=Date.parse(payment.paid_at),end=eventEndTimestamp(event);return Number.isFinite(paidAt)&&paidAt<=end+cutoff*3600000}).length;return paidWithin/row.paidEvents.length*100};
       row.winPct=row.played?Math.round(row.wins/row.played*100):0;row.rating=Math.round(1000+row.wins*28-row.losses*18+(row.pointsFor-row.pointsAgainst)*0.6+Math.min(row.attendance,20)*3);row.allBadges=playerBadges(row,true);row.badges=row.allBadges.slice(0,3);return row;
     }
     function defaultBadgeDefinitions(){return[{name:'Form King',description:'Won at least 75% of the most recent five completed matches.',min_played:5,min_win_pct:75,match_window:5,sort_order:10},{name:'Regular',description:'Attended at least four of the five most recent sessions.',min_attendance:4,attendance_window:5,sort_order:20},{name:'Point Machine',description:'A standout positive point differential.',min_point_diff:20,sort_order:30},{name:'Veteran',description:'Played more than 50 completed matches.',min_played:51,sort_order:40},{name:'Paid Up Pro',description:'Cleared 100% of payments within 24 hours of each session ending.',min_attendance:1,min_paid_rate:100,payment_within_hours:24,sort_order:50},{name:'Legend',description:'Played at least 50 completed matches and has at least a 70% win rate.',min_played:50,min_win_pct:70,sort_order:60},{name:'Disgrace',description:'Lost all five of the most recent completed matches.',min_played:5,max_wins:0,match_window:5,sort_order:70},{name:'Building Form',description:'Won at least 40% of the most recent five completed matches.',min_played:5,min_win_pct:40,match_window:5,sort_order:90},{name:'Fresh Legs',description:'Played between one and five completed matches.',min_played:1,max_played:5,sort_order:100}]}
@@ -385,6 +391,7 @@
         if(def.max_attendance!=null&&attendanceCount>Number(def.max_attendance))return false;
         if(def.min_point_diff!=null&&m.pointsFor-m.pointsAgainst<Number(def.min_point_diff))return false;
         if(def.max_point_diff!=null&&m.pointsFor-m.pointsAgainst>Number(def.max_point_diff))return false;
+        if(def.payment_within_hours!=null&&m.paymentWindowPending(Number(def.payment_within_hours)))return false;
         const paidRate=def.payment_within_hours!=null?m.paymentRateWithin(def.payment_within_hours):m.paymentRate;
         if(def.min_paid_rate!=null&&paidRate<Number(def.min_paid_rate))return false;
         if(def.max_paid_rate!=null&&paidRate>Number(def.max_paid_rate))return false;
