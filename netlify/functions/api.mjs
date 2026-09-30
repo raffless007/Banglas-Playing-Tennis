@@ -45,6 +45,18 @@ const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || process.env.G
 const rateBuckets = new Map();
 const signedMediaUrlCache = new Map();
 const locationCache = { value: null, expiresAt: 0, promise: null };
+// Reuse validation only inside the same HTTP request. Revocations and PIN
+// changes are still checked against the database on every new request.
+const requestValidations = new WeakMap();
+function validateOnce(req, key, operation) {
+  let validations = requestValidations.get(req);
+  if (!validations) {
+    validations = new Map();
+    requestValidations.set(req, validations);
+  }
+  if (!validations.has(key)) validations.set(key, operation());
+  return validations.get(key);
+}
 
 const headers = { "content-type": "application/json; charset=utf-8" };
 const reply = (data, status = 200, extra = {}) =>
@@ -429,6 +441,10 @@ function isAdmin(req) {
 }
 
 async function isAdminSession(req) {
+  return validateOnce(req, "admin", () => validateAdminSession(req));
+}
+
+async function validateAdminSession(req) {
   const payload = adminTokenPayload(req);
   if (!payload) return false;
   // Legacy tokens have no server-side session id and remain valid until their
@@ -459,6 +475,10 @@ async function createAdminSession() {
 }
 
 async function isPlayer(req, playerId) {
+  return validateOnce(req, `player:${playerId}`, () => validatePlayerSession(req, playerId));
+}
+
+async function validatePlayerSession(req, playerId) {
   const token = req.headers.get("x-player-session") || "";
   const [payload, signature] = token.split(".");
   if (!payload || !signature) return false;
@@ -467,8 +487,14 @@ async function isPlayer(req, playerId) {
   try {
     const session = JSON.parse(Buffer.from(payload, "base64url").toString());
     if (session.type !== "player" || session.sub !== playerId || session.exp <= Date.now()) return false;
+    // The active-player/PIN check and tracked-session read are independent.
+    const [rows, active] = await Promise.all([
+      db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=pin_updated_at`),
+      session.sid ? db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}&player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null&select=session_id,last_seen_at`) : Promise.resolve(null),
+    ]);
+    const pinUpdatedAt = Date.parse(rows?.[0]?.pin_updated_at || "");
+    if (!rows?.length || (Number.isFinite(pinUpdatedAt) && pinUpdatedAt > Number(session.iat || 0))) return false;
     if (session.sid) {
-      const active = await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}&player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null&select=session_id,last_seen_at`);
       if (!active?.length) return false;
       const lastSeen = Date.parse(active[0].last_seen_at || "");
       if (Number.isFinite(lastSeen) && Date.now() - lastSeen > PLAYER_SERVER_IDLE_MS) {
@@ -477,9 +503,7 @@ async function isPlayer(req, playerId) {
       }
       await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
     }
-    const rows = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=pin_updated_at`);
-    const pinUpdatedAt = Date.parse(rows?.[0]?.pin_updated_at || "");
-    return !!rows?.length && (!Number.isFinite(pinUpdatedAt) || pinUpdatedAt <= Number(session.iat || 0));
+    return true;
   } catch { return false; }
 }
 
@@ -2548,7 +2572,6 @@ export default async (req) => {
     const url = new URL(req.url);
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
-    const adminSessionValid = await isAdminSession(req);
 
     if (req.method === "POST" && ["player-login", "admin-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
       return reply({ error: "Too many sign-in attempts. Please wait a minute and try again." }, 429, { "retry-after": "60" });
@@ -2574,6 +2597,7 @@ export default async (req) => {
     if (req.method === "GET" && action === "realtime-config") return reply({ configured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY), url: SUPABASE_URL || null, anonKey: SUPABASE_ANON_KEY || null });
     if (req.method === "GET" && action === "sync-version") return syncVersion();
 
+    const adminSessionValid = await isAdminSession(req);
     const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "badge-sync", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;

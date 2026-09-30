@@ -685,7 +685,7 @@
     // Keep normal interactions responsive: state refreshes are single-flight,
     // media is loaded only when its page is opened, and live scores use a
     // small dedicated poll rather than reloading the entire clubhouse state.
-    let refreshInFlight=null,mediaLoaded=false,mediaLoadInFlight=null,livePollInFlight=false,eoiPollInFlight=false,eoiPending=new Set();
+    let refreshInFlight=null,mediaLoaded=false,mediaLoadedAt=0,mediaLoadedPlayerId=null,mediaLoadInFlight=null,livePollInFlight=false,eoiPollInFlight=false,eoiPending=new Set();
     const requestWithMedia=request;
     request=async function(action,method='GET',body,admin=false){
       const result=await requestWithMedia(action,method,body,admin);
@@ -707,25 +707,26 @@
     };
     async function loadMediaState(force=false){
       if(!force&&mediaLoaded)return;
-      if(mediaLoadInFlight)return mediaLoadInFlight;
-      mediaLoadInFlight=(async()=>{const result=await request('media-state');data.media=result.media||[];data.mediaUsage=result.mediaUsage||0;data.mediaLimit=result.mediaLimit||data.mediaLimit;if($('mediaPage')?.classList.contains('active')){renderMedia();enhanceMediaGallery()}mediaLoaded=true})().finally(()=>{mediaLoadInFlight=null});
+      if(mediaLoadInFlight){await mediaLoadInFlight;if(!mediaLoaded||mediaLoadedPlayerId!==currentPlayerId)return loadMediaState(force);return}
+      const requestedPlayerId=currentPlayerId;
+      mediaLoadInFlight=(async()=>{const result=await request('media-state');if(requestedPlayerId!==currentPlayerId)return;data.media=result.media||[];data.mediaUsage=result.mediaUsage||0;data.mediaLimit=result.mediaLimit||data.mediaLimit;if($('mediaPage')?.classList.contains('active')){renderMedia();enhanceMediaGallery()}mediaLoaded=true;mediaLoadedAt=Date.now();mediaLoadedPlayerId=requestedPlayerId})().finally(()=>{mediaLoadInFlight=null});
       return mediaLoadInFlight;
     }
     const goWithoutLazyMedia=go;
-    go=function(page){goWithoutLazyMedia(page);if(page==='media')loadMediaState(true)};
-    async function pollLiveState(){
-      if(livePollInFlight||!$('scoresPage')?.classList.contains('active')||livePointPending.size)return;
+    go=function(page){if(page==='media'&&mediaLoadedPlayerId!==currentPlayerId){mediaLoaded=false;mediaLoadedAt=0;data.media=[];data.mediaUsage=0}goWithoutLazyMedia(page);if(page==='media')loadMediaState(Date.now()-mediaLoadedAt>60000).catch(error=>notify(error.message))};
+    async function pollLiveState(force=false){
+      if(document.visibilityState==='hidden'||(!playerToken&&!adminToken)||livePollInFlight||(!force&&!$('scoresPage')?.classList.contains('active'))||livePointPending.size)return;
       livePollInFlight=true;
       try{
         const result=await request('live-state'),incoming=result.liveMatches||[],previous=data.liveMatches||[];
         const signature=items=>items.map(m=>`${m.id}:${m.updated_at}:${m.version}:${m.completed}`).sort().join('|');
-        if(signature(incoming)!==signature(previous)){data.liveMatches=incoming;renderScores()}
+        if(signature(incoming)!==signature(previous)){data.liveMatches=incoming;if($('scoresPage')?.classList.contains('active'))renderScores()}
       }catch{/* The normal refresh path will recover transient polling failures. */}
       finally{livePollInFlight=false}
     }
     setInterval(pollLiveState,2000);
     async function pollEoiState(){
-      if(eoiPollInFlight||eoiPending.size||!$('playPage')?.classList.contains('active'))return;
+      if(document.visibilityState==='hidden'||(!playerToken&&!adminToken)||eoiPollInFlight||eoiPending.size||!$('playPage')?.classList.contains('active'))return;
       eoiPollInFlight=true;
       try{
         const result=await request('eoi-state'),incoming=result.eois||[],previous=data.eois||[];
@@ -889,7 +890,15 @@
     function ensureSyncStatus(){let node=$('syncStatus');if(!node){const host=document.querySelector('.account-actions');if(!host)return null;node=document.createElement('span');node.id='syncStatus';node.className='sync-status';host.insertBefore(node,host.firstElementChild)}return node}
     function setSyncStatus(mode,label){bptSyncStatus.mode=mode;const node=ensureSyncStatus();if(node){node.textContent=label||({live:'Live sync',syncing:'Syncing…',offline:'Offline — changes queued',error:'Sync delayed'}[mode]||'Syncing…');node.className='sync-status sync-'+mode;node.title=mode==='offline'?'Live score changes are saved on this device and will sync when you reconnect.':'Clubhouse data updates automatically.'}}
     async function pollSyncVersion(){if(!navigator.onLine||adminDirty||adminBusy)return;try{const result=await request('sync-version');if(bptSyncStatus.version!==null&&result.version!==bptSyncStatus.version){setSyncStatus('syncing');scheduleRefresh()}bptSyncStatus.version=result.version;if(bptSyncStatus.mode!=='offline')setSyncStatus('live')}catch{if(bptSyncStatus.mode!=='offline')setSyncStatus('error')}}
-    function setupRealtimeSync(){if(bptSyncStatus.ws||!navigator.onLine)return;request('realtime-config').then(config=>{if(!config.configured||!config.anonKey)return;const ws=new WebSocket(String(config.url).replace(/^http/,'ws')+'/realtime/v1/websocket?apikey='+encodeURIComponent(config.anonKey)+'&vsn=1.0.0');bptSyncStatus.ws=ws;setSyncStatus('syncing');ws.onopen=()=>{bptSyncStatus.reconnect=0;ws.send(JSON.stringify({topic:'realtime:clubhouse',event:'phx_join',payload:{config:{broadcast:{self:false},presence:{key:''},postgres_changes:[{event:'*',schema:'public',table:'events'},{event:'*',schema:'public',table:'eois'},{event:'*',schema:'public',table:'payments'},{event:'*',schema:'public',table:'match_scores'},{event:'*',schema:'public',table:'live_matches'}]}},ref:'1'}));setSyncStatus('live')};ws.onmessage=event=>{try{const message=JSON.parse(event.data);if(message.event==='postgres_changes'&&!adminDirty&&!livePointPending.size)scheduleRefresh()}catch{}};ws.onerror=()=>setSyncStatus('error');ws.onclose=()=>{bptSyncStatus.ws=null;if(navigator.onLine){setSyncStatus('error');const delay=Math.min(30000,1000*2**(bptSyncStatus.reconnect++));setTimeout(setupRealtimeSync,delay)}}}).catch(()=>{})}
+    function handleRealtimeChange(message){
+      if(message.event!=='postgres_changes'||adminDirty||livePointPending.size)return;
+      const table=message.payload?.data?.table||message.payload?.table;
+      // Points change only the live scoreboard. Reloading all history, avatars
+      // and badge calculations for each point creates avoidable server work.
+      if(table==='live_matches'){void pollLiveState(true);return}
+      scheduleRefresh();
+    }
+    function setupRealtimeSync(){if(bptSyncStatus.ws||!navigator.onLine)return;request('realtime-config').then(config=>{if(!config.configured||!config.anonKey)return;const ws=new WebSocket(String(config.url).replace(/^http/,'ws')+'/realtime/v1/websocket?apikey='+encodeURIComponent(config.anonKey)+'&vsn=1.0.0');bptSyncStatus.ws=ws;setSyncStatus('syncing');ws.onopen=()=>{bptSyncStatus.reconnect=0;ws.send(JSON.stringify({topic:'realtime:clubhouse',event:'phx_join',payload:{config:{broadcast:{self:false},presence:{key:''},postgres_changes:[{event:'*',schema:'public',table:'events'},{event:'*',schema:'public',table:'eois'},{event:'*',schema:'public',table:'payments'},{event:'*',schema:'public',table:'match_scores'},{event:'*',schema:'public',table:'live_matches'}]}},ref:'1'}));setSyncStatus('live')};ws.onmessage=event=>{try{handleRealtimeChange(JSON.parse(event.data))}catch{}};ws.onerror=()=>setSyncStatus('error');ws.onclose=()=>{bptSyncStatus.ws=null;if(navigator.onLine){setSyncStatus('error');const delay=Math.min(30000,1000*2**(bptSyncStatus.reconnect++));setTimeout(setupRealtimeSync,delay)}}}).catch(()=>{})}
     window.addEventListener('online',()=>{setSyncStatus('syncing');setupRealtimeSync();flushOfflineLive();pollSyncVersion()});window.addEventListener('offline',()=>{setSyncStatus('offline');showSyncBanner('You are offline. Changes will retry when you reconnect.')});document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&bptSyncStatus.ws){bptSyncStatus.ws.close();bptSyncStatus.ws=null}else if(document.visibilityState==='visible'){setupRealtimeSync();pollSyncVersion()}});setInterval(pollSyncVersion,300000);setTimeout(setupRealtimeSync,1200);
 
     const LIVE_OFFLINE_QUEUE_KEY='bpt-live-offline-queue';
