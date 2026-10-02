@@ -419,6 +419,9 @@ create table if not exists public.badges (
   constraint badges_payment_within_hours_check check (payment_within_hours is null or (payment_within_hours > 0 and payment_within_hours <= 720))
 );
 
+-- Keep the same badge identity when this schema is reapplied to an older app.
+update public.badges set name = 'Tough Stretch' where name = 'Disgrace';
+
 insert into public.badges
   (name, description, min_played, min_wins, max_wins, min_win_pct, min_attendance, min_point_diff, min_paid_rate, match_window, attendance_window, payment_within_hours, fallback_type, sort_order)
 values
@@ -428,7 +431,7 @@ values
   ('Veteran', 'Played more than 50 completed matches.', 51, null, null, null, null, null, null, null, null, null, null, 40),
   ('Paid Up Pro', 'Cleared 100% of payments within 24 hours of each session ending.', null, null, null, null, 1, null, 100, null, null, 24, null, 50),
   ('Legend', 'Played at least 50 completed matches and has at least a 70% win rate.', 50, null, null, 70, null, null, null, null, null, null, null, 60),
-  ('Disgrace', 'Lost all five of the most recent completed matches.', 5, null, 0, null, null, null, null, 5, null, null, null, 70),
+  ('Tough Stretch', 'Lost all five of the most recent completed matches.', 5, null, 0, null, null, null, null, 5, null, null, null, 70),
   ('Building Form', 'Won at least two of the five most recent completed matches.', 5, 2, null, null, null, null, null, 5, null, null, null, 90),
   ('Fresh Legs', 'Played at least one completed match.', 1, null, null, null, null, null, null, null, null, null, null, 100)
 on conflict (name) do nothing;

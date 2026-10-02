@@ -19,7 +19,7 @@ function token(type) {
 // reads production credentials, sends network requests, or writes a database.
 function fixture(source = apiSource, delay = 0) {
   const calls = [];
-  const state = { revoked: false, active: true, pinUpdatedAt: null, lastSeen: new Date().toISOString() };
+  const state = { revoked: false, active: true, pinUpdatedAt: null, lastSeen: new Date().toISOString(), previousBadges: [] };
   const events = Array.from({ length: 40 }, (_, offset) => {
     const day = new Date(); day.setUTCDate(day.getUTCDate() + offset);
     return { id: `week-${offset}`, event_date: day.toISOString().slice(0, 10), start_time: "20:00:00", end_time: "22:00:00", timezone: "Australia/Sydney", court_fee: 54, location: "Synthetic court", suburb: "Test" };
@@ -35,6 +35,7 @@ function fixture(source = apiSource, delay = 0) {
     if (table === "players") rows = state.active ? [{ id: playerId, name: "Synthetic player", active: true, pin_hash: "configured", pin_updated_at: state.pinUpdatedAt }] : [];
     if (["admin_sessions", "player_sessions"].includes(table)) rows = state.revoked ? [] : [{ session_id: sessionId, last_seen_at: state.lastSeen }];
     if (table === "events") rows = events;
+    if (table === "player_badge_states") rows = state.previousBadges;
     return new Response(JSON.stringify(rows));
   };
   const body = source.replace(/^import[\s\S]*?;\n/gm, "").replace(/^export \{[^}]*\};/gm, "").replace("export default async (req) =>", "return async (req) =>");
@@ -166,6 +167,28 @@ test("badge sync does not repeat player validation inside a request", async () =
   const app = fixture();
   assert.equal((await app.request("badge-sync", "player", "POST", { playerId, badges: [] })).status, 200);
   assert.deepEqual(app.calls.filter(call => call.table === "player_sessions").map(call => call.method), ["GET", "PATCH"]);
+});
+
+test("renaming the losing-streak badge retains its criteria and sends no transition notification", async () => {
+  const source = [...index.matchAll(/    function defaultBadgeDefinitions\(\).*\n/g)].at(-1)[0];
+  const definitions = new Function(`${source};return defaultBadgeDefinitions();`)();
+  const badge = definitions.find(item => item.name === "Tough Stretch");
+  assert.ok(badge);
+  assert.equal(badge.min_played, 5);
+  assert.equal(badge.max_wins, 0);
+  assert.equal(badge.match_window, 5);
+  assert.ok(!definitions.some(item => item.name === "Disgrace"));
+  assert.match(index, /'Tough Stretch':'💥'/);
+  const app = fixture();
+  app.state.previousBadges = [{ badge_key: "same-badge-id", badge_name: "Disgrace", active: true, rule_version: "old" }];
+  const response = await app.request("badge-sync", "player", "POST", { playerId, badges: [{ key: "same-badge-id", name: "Tough Stretch", version: "renamed" }] });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).created, 0);
+  assert.ok(!app.calls.some(call => call.table === "player_notifications"), "A rename is not an assignment/removal");
+  const migration = await readFile(new URL("../supabase/migrations/20261002044219_rename_disgrace_badge.sql", import.meta.url), "utf8");
+  assert.match(migration, /set name = 'Tough Stretch', updated_at = now\(\)/);
+  assert.match(migration, /badge\.id::text = state\.badge_key/);
+  assert.doesNotMatch(migration, /\b(insert|delete)\b|set\s+(id|active|min_played|max_wins|match_window)\s*=/i);
 });
 
 test("admin validation overlaps the state data fetches", async () => {
