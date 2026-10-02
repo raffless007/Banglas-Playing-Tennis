@@ -62,6 +62,93 @@ test("admin state validates and touches its session once per request", async () 
   assert.equal(revoked.status, 401, "A new request must observe revocation");
 });
 
+test("server sessions survive reopening at 30 minutes and enforce the new idle limits", async () => {
+  for (const [type, minutes, expected] of [
+    ["player", 30, 200], ["player", 23 * 60 + 59, 200], ["player", 24 * 60, 401],
+    ["admin", 30, 200], ["admin", 59, 200], ["admin", 60, 401],
+  ]) {
+    const app = fixture();
+    app.state.lastSeen = new Date(Date.now() - minutes * 60000).toISOString();
+    const response = type === "admin"
+      ? await app.request("admin-state", type)
+      : await app.request("notification-read-all", type, "POST", { playerId });
+    assert.equal(response.status, expected, `${type} session idle for ${minutes} minutes`);
+  }
+  const revoked = fixture();
+  revoked.state.revoked = true;
+  assert.equal((await revoked.request("notification-read-all", "player", "POST", { playerId })).status, 401);
+});
+
+test("frontend and backend idle limits match, including expiry messages", () => {
+  const server = new Function(`${apiSource.match(/const PLAYER_SERVER_IDLE_MS[^;]*;/)[0]}\n${apiSource.match(/const ADMIN_SERVER_IDLE_MS[^;]*;/)[0]}\nreturn [PLAYER_SERVER_IDLE_MS,ADMIN_SERVER_IDLE_MS];`)();
+  const client = new Function(`${index.match(/const PLAYER_SESSION_IDLE_MS[^;]*;/)[0]}\nreturn [PLAYER_SESSION_IDLE_MS,ADMIN_SESSION_IDLE_MS];`)();
+  assert.deepEqual(server, [24 * 3600000, 3600000]);
+  assert.deepEqual(client, server);
+  assert.doesNotMatch(index, /session expired after (15|10) minutes/);
+});
+
+function memoryStore() {
+  const values = new Map();
+  return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: key => values.delete(key) };
+}
+function adminStore(localStorage, sessionStorage) {
+  const source = index.slice(index.indexOf("    const adminSessionStore="), index.indexOf("    let data="));
+  return new Function("localStorage", "window", `${source};return adminSessionStore;`)(localStorage, { sessionStorage });
+}
+
+test("admin storage migrates legacy tabs and survives app close, then clears on lock", () => {
+  const local = memoryStore(), legacy = memoryStore();
+  legacy.setItem("bpt-admin-token", "synthetic-admin");
+  legacy.setItem("bpt-admin-last-activity", "12345");
+  const first = adminStore(local, legacy);
+  assert.equal(first.getItem("bpt-admin-token"), "synthetic-admin");
+  assert.equal(first.getItem("bpt-admin-last-activity"), "12345");
+  assert.equal(legacy.getItem("bpt-admin-token"), null);
+  const reopened = adminStore(local, memoryStore());
+  assert.equal(reopened.getItem("bpt-admin-token"), "synthetic-admin");
+  assert.equal(reopened.getItem("bpt-admin-last-activity"), "12345", "Reopening must not reset the idle clock");
+  reopened.removeItem("bpt-admin-token");
+  reopened.removeItem("bpt-admin-last-activity");
+  assert.equal(adminStore(local, memoryStore()).getItem("bpt-admin-token"), null);
+});
+
+function timerFixture(minutes) {
+  const now = Date.now(), local = memoryStore(), session = memoryStore(), messages = [];
+  local.setItem("bpt-player-last-activity", now - minutes * 60000);
+  local.setItem("bpt-admin-last-activity", now - minutes * 60000);
+  local.setItem("bpt-admin-token", "admin");
+  const context = { localStorage: local, adminSessionStore: adminStore(local, session),
+    playerToken: "player", adminToken: "admin", adminDirty: false, adminPlayers: [], adminGuestHistory: [], loginPromptRun: false,
+    Date: class extends Date { static now() { return now; } }, setInterval: () => 1, clearInterval() {},
+    renderPlayerChooser() {}, renderAdmin() {}, renderMedia() {},
+    $: () => ({ classList: { remove() {} } }), notify: message => messages.push(message) };
+  const source = index.slice(index.indexOf("    const PLAYER_SESSION_IDLE_MS="), index.indexOf("    function notify("));
+  const timer = new Function("context", `with(context){${source};return {resume:checkSessionOnResume,lock:lockAdminSession};}`)(context);
+  return { context, timer, messages, local };
+}
+
+test("frontend resume and manual lock enforce the intended timers without misleading messages", () => {
+  const halfHour = timerFixture(30);
+  halfHour.timer.resume();
+  assert.equal(halfHour.context.playerToken, "player");
+  assert.equal(halfHour.context.adminToken, "admin");
+  assert.deepEqual(halfHour.messages, []);
+  const oneHour = timerFixture(60);
+  oneHour.timer.resume();
+  assert.equal(oneHour.context.playerToken, "player");
+  assert.equal(oneHour.context.adminToken, null);
+  assert.equal(oneHour.local.getItem("bpt-admin-token"), null);
+  assert.match(oneHour.messages[0], /1 hour/);
+  const day = timerFixture(24 * 60);
+  day.timer.resume();
+  assert.equal(day.context.playerToken, null);
+  assert.match(day.messages[0], /24 hours/);
+  halfHour.timer.lock();
+  assert.equal(halfHour.context.adminToken, null);
+  assert.deepEqual(halfHour.messages, ["Admin locked."]);
+  assert.match(index, /function switchPlayerLogin\(\)\{if\(adminToken\)expireAdminSession\(false\)/);
+});
+
 test("player validation overlaps independent reads and rejects PIN changes and expired sessions", async () => {
   const app = fixture(apiSource, 15);
   assert.equal((await app.request("notification-read-all", "player", "POST", { playerId })).status, 200);

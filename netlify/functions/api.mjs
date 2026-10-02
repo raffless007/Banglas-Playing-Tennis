@@ -27,8 +27,8 @@ const MEDIA_TOTAL_BYTES = 5 * 1024 * 1024 * 1024;
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
-const PLAYER_SERVER_IDLE_MS = 15 * 60 * 1000;
-const ADMIN_SERVER_IDLE_MS = 10 * 60 * 1000;
+const PLAYER_SERVER_IDLE_MS = 24 * 60 * 60 * 1000;
+const ADMIN_SERVER_IDLE_MS = 60 * 60 * 1000;
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 // Optional publishable key used only by the browser for low-latency sync. The
 // service-role key is never returned to clients.
@@ -455,7 +455,7 @@ async function validateAdminSession(req) {
     const row = rows?.[0];
     if (!row) return false;
     const lastSeen = Date.parse(row.last_seen_at || "");
-    if (Number.isFinite(lastSeen) && Date.now() - lastSeen > ADMIN_SERVER_IDLE_MS) {
+    if (Number.isFinite(lastSeen) && Date.now() - lastSeen >= ADMIN_SERVER_IDLE_MS) {
       await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
       return false;
     }
@@ -497,7 +497,7 @@ async function validatePlayerSession(req, playerId) {
     if (session.sid) {
       if (!active?.length) return false;
       const lastSeen = Date.parse(active[0].last_seen_at || "");
-      if (Number.isFinite(lastSeen) && Date.now() - lastSeen > PLAYER_SERVER_IDLE_MS) {
+      if (Number.isFinite(lastSeen) && Date.now() - lastSeen >= PLAYER_SERVER_IDLE_MS) {
         await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
         return false;
       }
