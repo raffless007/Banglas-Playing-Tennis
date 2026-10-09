@@ -648,6 +648,7 @@ async function appState(req) {
   if (playerId) {
     const pending = [];
     for (const event of events) {
+      if (event.deleted_at || event.cancellation_status === "cancelled" || event.account_closed) continue;
       if (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) > new Date()) continue;
       const inThisWeek = eois.some(row => row.event_id === event.id && row.player_id === playerId && row.status === "yes" && row.waitlist_position == null);
       const paid = payments.some(row => row.event_id === event.id && row.player_id === playerId && row.paid);
@@ -1801,7 +1802,7 @@ async function deleteEvent(body) {
     await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+      body: JSON.stringify({ deleted_at: new Date().toISOString(), cancellation_status: "cancelled", account_closed: true, updated_at: new Date().toISOString() }),
     });
   } catch {
     // Legacy projects without deleted_at retain the historical hard-delete

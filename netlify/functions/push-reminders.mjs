@@ -101,7 +101,7 @@ async function matchRainChance(event) {
 export default async () => {
   if (!pushConfigured()) return new Response("Push notifications are not configured.", { status: 200 });
   const [events, eois, payments, allPlayers, schedules] = await Promise.all([
-    db("events?select=*&order=event_date.asc"),
+    db("events?deleted_at=is.null&select=*&order=event_date.asc"),
     db("eois?select=event_id,player_id,status,waitlist_position"),
     db("payments?select=event_id,player_id,paid"),
     activePlayerIds(),
@@ -109,6 +109,9 @@ export default async () => {
   ]);
   const now = Date.now();
   for (const event of events) {
+    // Soft-deleted/cancelled sessions did not take place. Do not send EOI,
+    // payment or weather reminders, even if attendance records remain.
+    if (event.deleted_at || event.cancellation_status === "cancelled") continue;
     const startsAt = localDateTimeToUtc(event.event_date, startTime(event), event.timezone || SYDNEY).getTime();
     const endsAt = localDateTimeToUtc(event.event_date, endTime(event), event.timezone || SYDNEY).getTime();
     const deadline = startsAt - 6 * 60 * 60 * 1000;

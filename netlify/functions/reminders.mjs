@@ -64,13 +64,14 @@ export default async () => {
   if (!SUPABASE_URL || !SERVICE_KEY) throw new Error("Supabase environment variables are missing.");
   const now = Date.now();
   const [events, players, eois, payments] = await Promise.all([
-    db("events?account_closed=eq.false&select=*"),
+    db("events?deleted_at=is.null&account_closed=eq.false&select=*"),
     db("players?active=eq.true&select=id,name,email"),
     db("eois?status=eq.yes&select=event_id,player_id"),
     db("payments?paid=eq.true&select=event_id,player_id"),
   ]);
 
   for (const event of events) {
+    if (event.deleted_at || event.cancellation_status === "cancelled" || event.account_closed) continue;
     const ended = localToUtc(event.event_date, event.end_time, event.timezone).getTime();
     const hours = (now - ended) / 3600000;
     if (hours < 48) continue;
