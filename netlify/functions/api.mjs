@@ -36,6 +36,10 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_
 // The app currently has one shared admin passcode. Set ADMIN_DISPLAY_NAME in
 // Netlify to identify the admin in the append-only activity history.
 const ADMIN_DISPLAY_NAME = process.env.ADMIN_DISPLAY_NAME || "Rafeed Abrar";
+// Account-level admin binding is server-controlled and tied to the immutable
+// roster ID, never a display name or a client-supplied role. Override with an
+// empty ADMIN_PLAYER_IDS value to disable profile-linked admin access.
+const ADMIN_PLAYER_IDS = new Set((process.env.ADMIN_PLAYER_IDS ?? "34997eec-ac2e-46c0-8473-816733ef0df5").split(",").map(id => id.trim()).filter(Boolean));
 const WEBAUTHN_RP_NAME = process.env.WEBAUTHN_RP_NAME || "Banglas Playing Tennis";
 const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || "";
 const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean);
@@ -48,6 +52,13 @@ const locationCache = { value: null, expiresAt: 0, promise: null };
 // Reuse validation only inside the same HTTP request. Revocations and PIN
 // changes are still checked against the database on every new request.
 const requestValidations = new WeakMap();
+const requestContexts = new WeakMap();
+async function afterResponse(req, operation) {
+  const task = Promise.resolve().then(operation).catch(error => console.error("Post-save task failed", error?.message || error));
+  const context = requestContexts.get(req);
+  if (typeof context?.waitUntil === "function") context.waitUntil(task);
+  else await task; // Local/older runtimes must not silently discard audit work.
+}
 function validateOnce(req, key, operation) {
   let validations = requestValidations.get(req);
   if (!validations) {
@@ -209,6 +220,33 @@ function scoringWindowError(event) {
   return "";
 }
 
+function nextScoringDeadline(event, events) {
+  const opens = localDateTimeToUtc(event.event_date, eventStartTime(event), event.timezone || SYDNEY);
+  const starts = (events || []).filter(row => row.id !== event.id && !row.deleted_at && row.cancellation_status !== "cancelled")
+    .map(row => localDateTimeToUtc(row.event_date, eventStartTime(row), row.timezone || SYDNEY))
+    .filter(date => date > opens).sort((a, b) => a - b);
+  return starts[0] || null;
+}
+
+async function manualScoringWindowError(event) {
+  if (event.deleted_at || event.cancellation_status === "cancelled") return "This session was cancelled or deleted.";
+  const now = new Date(), opens = localDateTimeToUtc(event.event_date, eventStartTime(event), event.timezone || SYDNEY);
+  if (now < opens) return "Scoring opens when this week’s session starts.";
+  const closes = nextScoringDeadline(event, await listVisibleEvents());
+  return closes && now >= closes ? "Score entry closed when the next session started. Ask an admin to add or correct this result." : "";
+}
+
+function completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) {
+  // Players often enter the pre-tie-break games (3–3). Store the final
+  // 4–3 result once a valid tie-break establishes the winner. Race-to-2
+  // Singles deliberately retains its existing 2–2 representation.
+  if (gamesToWin === 4 && gamesA === 3 && gamesB === 3 && Number.isInteger(tiebreakA) && Number.isInteger(tiebreakB)) {
+    if (tiebreakA > tiebreakB) gamesA = 4;
+    else if (tiebreakB > tiebreakA) gamesB = 4;
+  }
+  return { gamesA, gamesB, ...validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin) };
+}
+
 async function mediaUrl(path) {
   const cached = signedMediaUrlCache.get(path);
   if (cached && cached.expiresAt > Date.now()) return cached.url;
@@ -236,7 +274,7 @@ async function mediaUrlForState(path) {
 }
 
 async function auditActor(req) {
-  if (await isAdminSession(req)) return { actor_type: "admin", actor_player_id: null, actor_name: ADMIN_DISPLAY_NAME };
+  if (await isAdminSession(req)) return { actor_type: "admin", actor_player_id: adminTokenPayload(req)?.sub || null, actor_name: ADMIN_DISPLAY_NAME };
   const playerId = playerSessionSubject(req);
   if (!playerId) return { actor_type: "anonymous", actor_player_id: null, actor_name: "Anonymous visitor" };
   let actorName = null;
@@ -383,9 +421,9 @@ function verifyPasscode(passcode, stored) {
   return actual.length === expectedBuffer.length && timingSafeEqual(actual, expectedBuffer);
 }
 
-function signSession(sessionId = null) {
+function signSession(sessionId = null, playerId = null) {
   const now = Date.now();
-  const payload = Buffer.from(JSON.stringify({ type: "admin", sid: sessionId || undefined, iat: now, exp: now + 8 * 60 * 60 * 1000 })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ type: "admin", sid: sessionId || undefined, sub: playerId || undefined, iat: now, exp: now + 8 * 60 * 60 * 1000 })).toString("base64url");
   const signature = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
@@ -447,6 +485,7 @@ async function isAdminSession(req) {
 async function validateAdminSession(req) {
   const payload = adminTokenPayload(req);
   if (!payload) return false;
+  if (payload.sub && (!ADMIN_PLAYER_IDS.has(payload.sub) || !(await isPlayer(req, payload.sub)))) return false;
   // Legacy tokens have no server-side session id and remain valid until their
   // signed expiry. New tokens are tracked when the table is available.
   if (!payload.sid) return true;
@@ -468,10 +507,18 @@ async function validateAdminSession(req) {
   }
 }
 
-async function createAdminSession() {
+async function createAdminSession(playerId = null) {
   const sessionId = randomUUID();
   await db("admin_sessions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ session_id: sessionId, label: "Admin browser" }) }).catch(error => console.error("Admin session tracking unavailable", error?.message || error));
-  return signSession(sessionId);
+  return signSession(sessionId, playerId);
+}
+
+async function profileAdminLogin(req, body) {
+  const playerId = playerSessionSubject(req);
+  if (!playerId || body.playerId !== playerId || !ADMIN_PLAYER_IDS.has(playerId) || !(await isPlayer(req, playerId))) {
+    return reply({ error: "This signed-in profile does not have Admin access." }, 403);
+  }
+  return reply({ ok: true, token: await createAdminSession(playerId) });
 }
 
 async function isPlayer(req, playerId) {
@@ -660,7 +707,8 @@ async function appState(req) {
   }
   const authenticated = admin || Boolean(playerId);
   const publicEvents = admin ? events : events.map(event => (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) < new Date() ? { ...event, entry_pin: null } : event));
-  return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
+  const signedInPlayer = candidatePlayerId && await playerValidationPromise ? candidatePlayerId : null;
+  return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, profileAdmin: Boolean(signedInPlayer && ADMIN_PLAYER_IDS.has(signedInPlayer)), sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
 
 async function playerNotificationState(req) {
@@ -1076,22 +1124,22 @@ async function disablePushSubscription(body) {
   return reply({ ok: true });
 }
 
-async function submitEoi(body) {
+async function submitEoi(body, req) {
   if (!body.playerId || !body.eventId || !["yes", "no"].includes(body.status)) return reply({ error: "Invalid EOI." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
   const closesAt = new Date(localDateTimeToUtc(event.event_date, eventStartTime(event), event.timezone).getTime() - 6 * 60 * 60 * 1000);
   if (new Date() >= closesAt) return reply({ error: "The EOI deadline has passed." }, 409);
   let waitlistPosition = null;
-  const existing = (await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=status,waitlist_position`))?.[0] || null;
+  const eventEois = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&select=player_id,status,waitlist_position`);
+  const existing = eventEois.find(row => row.player_id === body.playerId) || null;
   if (body.status === "yes") {
-    const current = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
+    const current = eventEois.filter(row => row.status === "yes" && row.waitlist_position == null);
     const alreadyIn = current.some(row => row.player_id === body.playerId);
     if (!alreadyIn && existing?.status === "yes" && existing.waitlist_position != null) {
       waitlistPosition = Number(existing.waitlist_position);
     } else if (!alreadyIn && current.length >= eventPlayerCap(event)) {
-      const waiting = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&waitlist_position=not.is.null&select=waitlist_position&order=waitlist_position.desc&limit=1`);
-      waitlistPosition = Number(waiting?.[0]?.waitlist_position || 0) + 1;
+      waitlistPosition = Math.max(0, ...eventEois.filter(row => row.waitlist_position != null).map(row => Number(row.waitlist_position))) + 1;
     }
   }
   await db("eois?on_conflict=event_id,player_id", {
@@ -1100,10 +1148,12 @@ async function submitEoi(body) {
     body: JSON.stringify({ event_id: body.eventId, player_id: body.playerId, status: body.status, waitlist_position: body.status === "yes" ? waitlistPosition : null, updated_at: new Date().toISOString() }),
   });
   if (body.status === "yes" && Number.isInteger(waitlistPosition) && (!existing || existing.status !== "yes" || existing.waitlist_position == null)) {
-    const player = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=name`))?.[0] || { name: "A player" };
-    await notifyAdminWaitlist(event, player, waitlistPosition);
+    await afterResponse(req, async () => {
+      const player = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=name`))?.[0] || { name: "A player" };
+      await notifyAdminWaitlist(event, player, waitlistPosition);
+    });
   }
-  return reply({ ok: true, waitlisted: Number.isInteger(waitlistPosition) });
+  return reply({ ok: true, waitlisted: Number.isInteger(waitlistPosition), waitlistPosition });
 }
 
 async function markPaid(body) {
@@ -1523,14 +1573,15 @@ async function finishLiveMatch(body, adminOverride = false) {
   return reply({ ok: true, alreadySaved: !scoreId });
 }
 
-async function submitScore(body) {
+async function submitScore(body, adminOverride = false) {
   const event = await getEvent(body.eventId);
-  if (!event || !body.submittedBy) return reply({ error: "Event or player not found." }, 404);
-  const windowError = scoringWindowError(event);
+  if (!event || !body.submittedBy) return reply({ error: "Choose the session and the player recording this score." }, 404);
+  const windowError = adminOverride ? "" : await manualScoringWindowError(event);
   if (windowError) return reply({ error: windowError }, 403);
-  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
-  const attending = new Set(attendingRows.map(row => row.player_id));
-  if (!attending.has(body.submittedBy)) return reply({ error: "Only players marked In can enter scores." }, 403);
+  const attendingRows = adminOverride ? await db("players?select=id") : await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
+  const attending = new Set(attendingRows.map(row => row.player_id || row.id));
+  if (!adminOverride && !attending.has(body.submittedBy)) return reply({ error: "Only players marked In can enter scores." }, 403);
+  if (adminOverride && body.submittedBy && !attending.has(body.submittedBy)) return reply({ error: "Choose a scorer from the roster." }, 400);
   const matches = Array.isArray(body.matches) ? body.matches : [body];
   if (!matches.length) return reply({ error: "Add at least one match." }, 400);
   const inserts = [];
@@ -1545,10 +1596,11 @@ async function submitScore(body) {
     if (new Set(allPlayers).size !== requiredCount * 2 || allPlayers.some(id => !attending.has(id))) {
       return reply({ error: matchType === "singles" ? "Each singles match must contain two different players from the final In list." : "Each match must contain four different players from the final In list." }, 400);
     }
+    if ([match.gamesA, match.gamesB].some(value => value === "" || value == null)) return reply({ error: "Enter both game scores before saving." }, 400);
     const gamesA = Number(match.gamesA), gamesB = Number(match.gamesB);
     const tiebreakA = match.tiebreakA === "" || match.tiebreakA == null ? null : Number(match.tiebreakA);
     const tiebreakB = match.tiebreakB === "" || match.tiebreakB == null ? null : Number(match.tiebreakB);
-    const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
+    const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
     if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Singles race-to-2 scores must be 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Every score must be 4–0, 4–1, 4–2, or 4–3 with a valid race-to-5 tie-break won by two points." }, 400);
     inserts.push({
       event_id: body.eventId,
@@ -1556,8 +1608,8 @@ async function submitScore(body) {
       games_to_win: gamesToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
-      games_a: gamesA,
-      games_b: gamesB,
+      games_a: checked.gamesA,
+      games_b: checked.gamesB,
       tiebreak_a: checked.tiebreakA,
       tiebreak_b: checked.tiebreakB,
       points_a: Number.isInteger(Number(match.pointsA)) ? Number(match.pointsA) : 0,
@@ -1565,12 +1617,18 @@ async function submitScore(body) {
       submitted_by: body.submittedBy,
     });
   }
-  await db("match_scores", {
+  const submissionId = body.submissionId;
+  if (submissionId && !/^[0-9a-f-]{36}$/i.test(submissionId)) return reply({ error: "Invalid score submission identifier." }, 400);
+  if (submissionId) inserts.forEach((row, index) => {
+    const hex = createHmac("sha256", SESSION_SECRET).update(JSON.stringify([submissionId, index, row])).digest("hex").slice(0, 32);
+    row.id = `${hex.slice(0,8)}-${hex.slice(8,12)}-4${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20)}`;
+  });
+  const saved = await db(submissionId ? "match_scores?on_conflict=id" : "match_scores", {
     method: "POST",
-    headers: { Prefer: "return=minimal" },
+    headers: { Prefer: submissionId ? "resolution=ignore-duplicates,return=representation" : "return=representation" },
     body: JSON.stringify(inserts),
   });
-  return reply({ ok: true, saved: inserts.length });
+  return reply({ ok: true, saved: inserts.length, scores: saved || [], submissionId: submissionId || null });
 }
 
 async function saveEventNote(body) {
@@ -1607,7 +1665,7 @@ async function changePasscode(body) {
   return reply({ ok: true, token: await createAdminSession() });
 }
 
-async function saveEvent(body) {
+async function saveEvent(body, req) {
   const allowed = ["event_date", "start_time", "end_time", "location_id", "location", "suburb", "entry_pin", "court_1_name", "court_fee", "court_2_enabled", "court_2_name", "court_2_start_time", "court_2_end_time", "court_2_fee", "ball_fee", "account_closed", "max_players", "cancellation_status", "cancellation_reason", "recap_notes", "award_player_id", "template_name"];
   const update = Object.fromEntries(Object.entries(body.changes || {}).filter(([key]) => allowed.includes(key)));
   if ("court_1_name" in update) update.court_1_name = String(update.court_1_name || "Court 1").trim() || "Court 1";
@@ -1620,9 +1678,9 @@ async function saveEvent(body) {
   await db(`events?id=eq.${encodeURIComponent(body.eventId)}`, {
     method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(update),
   });
-  if (meaningful) {
+  if (meaningful && addingSecondCourt) await promoteWaitlistForEvent({ ...before, ...update }).catch(error => console.error("Waitlist promotion failed", error));
+  if (meaningful) await afterResponse(req, async () => {
     const updated = { ...before, ...update };
-    if (addingSecondCourt) await promoteWaitlistForEvent(updated).catch(error => console.error("Waitlist promotion failed", error));
     const playerIds = await activePlayerIds();
     const closingWeek = update.account_closed === true && before.account_closed !== true;
     const closure = closingWeek ? await eventClosureNotification(updated).catch(error => {
@@ -1637,8 +1695,8 @@ async function saveEvent(body) {
     try {
       await notifyPlayers({ playerIds, notificationType, notificationKey, eventId: updated.id, title, body, url: `/?page=play&event=${encodeURIComponent(updated.id)}` });
     } catch (error) { console.error("Session push failed", error); }
-  }
-  return reply({ ok: true });
+  });
+  return reply({ ok: true, event: { ...before, ...update } });
 }
 
 async function saveLocation(body) {
@@ -2172,7 +2230,7 @@ async function adminUpdateScore(body) {
   const gamesA = Number(body.gamesA), gamesB = Number(body.gamesB);
   const tiebreakA = body.tiebreakA === "" || body.tiebreakA == null ? null : Number(body.tiebreakA);
   const tiebreakB = body.tiebreakB === "" || body.tiebreakB == null ? null : Number(body.tiebreakB);
-  const checked = validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
+  const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
   if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Use a Singles race-to-2 score: 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-5 tie-break won by two." }, 400);
   const pointsA = Math.max(0, Math.trunc(Number(body.pointsA) || 0));
   const pointsB = Math.max(0, Math.trunc(Number(body.pointsB) || 0));
@@ -2184,8 +2242,8 @@ async function adminUpdateScore(body) {
       games_to_win: gamesToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
-      games_a: gamesA,
-      games_b: gamesB,
+      games_a: checked.gamesA,
+      games_b: checked.gamesB,
       tiebreak_a: checked.tiebreakA,
       tiebreak_b: checked.tiebreakB,
       points_a: pointsA,
@@ -2539,8 +2597,9 @@ async function duplicateEvent(body) {
 }
 
 async function runAudited(req, action, body, operation) {
+  const started = performance.now();
   let beforeState = null;
-  const highFrequency = ["eoi", "paid", "score"].includes(action);
+  const highFrequency = ["eoi", "paid", "score", "admin-add-score"].includes(action);
   if (!highFrequency) {
     try {
       if (body?.eventId) beforeState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || null;
@@ -2551,9 +2610,15 @@ async function runAudited(req, action, body, operation) {
       else if (body?.playerId) beforeState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || null;
     } catch { /* audit must never block the requested action */ }
   }
-  const result = await operation();
-  let afterState = body?.changes || null;
-  if (!highFrequency) {
+  let result;
+  try { result = await operation(); }
+  catch (error) {
+    await afterResponse(req, () => writeAudit(req, action, { ...body, failureReason: String(error?.message || "Save failed").slice(0, 500) }, "failed", beforeState, null));
+    throw error;
+  }
+  await afterResponse(req, async () => {
+    let afterState = body?.changes || null;
+    if (!highFrequency) {
     try {
       if (body?.eventId) afterState = (await db(`events?id=eq.${encodeURIComponent(body.eventId)}&select=*`))?.[0] || afterState;
       else if (body?.scoreId) afterState = (await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`))?.[0] || afterState;
@@ -2562,19 +2627,23 @@ async function runAudited(req, action, body, operation) {
       else if (body?.badgeId || (body?.id && ["admin-save-badge", "admin-delete-badge"].includes(action))) afterState = (await db(`badges?id=eq.${encodeURIComponent(body.badgeId || body.id)}&select=*`))?.[0] || afterState;
       else if (body?.playerId) afterState = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=id,name,active,email,mobile,address,avatar_path`))?.[0] || afterState;
     } catch { /* ignore */ }
-  }
-  await writeAudit(req, action, body, result.status >= 400 ? "failed" : "success", beforeState, afterState);
+    }
+    const failure = result.status >= 400 ? await result.clone().json().catch(() => ({})) : null;
+    await writeAudit(req, action, failure ? { ...body, failureReason: failure.error || "Request rejected", responseStatus: result.status } : body, failure ? "failed" : "success", beforeState, afterState);
+  });
+  result.headers.set("Server-Timing", `save;dur=${(performance.now() - started).toFixed(1)}`);
   return result;
 }
 
-export default async (req) => {
+export default async (req, context = {}) => {
+  requestContexts.set(req, context);
   try {
     requireConfiguration();
     const url = new URL(req.url);
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
 
-    if (req.method === "POST" && ["player-login", "admin-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
+    if (req.method === "POST" && ["player-login", "admin-login", "admin-profile-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
       return reply({ error: "Too many sign-in attempts. Please wait a minute and try again." }, 429, { "retry-after": "60" });
     }
     if (req.method === "POST" && ["player-pin-status", "player-create-pin"].includes(action) && !consumeRateLimit(req, `${action}:${body.playerId || "unknown"}`, 8, 15 * 60_000)) {
@@ -2589,6 +2658,7 @@ export default async (req) => {
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);
+    if (req.method === "POST" && action === "admin-profile-login") return profileAdminLogin(req, body);
     if (req.method === "POST" && action === "passkey-auth-options") return passkeyAuthenticationOptions(req);
     if (req.method === "POST" && action === "passkey-auth-verify") return passkeyAuthenticationVerify(req, body);
     if (req.method === "POST" && action === "guest-invite-info") return guestInviteInfo(body);
@@ -2607,9 +2677,9 @@ export default async (req) => {
         return reply({ error: "Your player session has expired. Please enter your PIN again." }, 401);
       }
     }
-    if (req.method === "POST" && action === "eoi") return runAudited(req, action, body, () => submitEoi(body));
+    if (req.method === "POST" && action === "eoi") return runAudited(req, action, body, () => submitEoi(body, req));
     if (req.method === "POST" && action === "paid") return runAudited(req, action, body, () => markPaid(body));
-    if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body));
+    if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body, adminSessionValid));
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body, adminSessionValid);
     if (req.method === "POST" && action === "live-server") return updateLiveServer(body, adminSessionValid);
     if (req.method === "POST" && action === "live-point") return addLivePoint(body, adminSessionValid);
@@ -2659,12 +2729,13 @@ export default async (req) => {
       if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
       return adminAlertSchedules();
     }
-    if (!["admin-change-passcode", "admin-save-event", "admin-save-location", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
+    if (!["admin-add-score", "admin-change-passcode", "admin-save-event", "admin-save-location", "admin-delete-event", "admin-add-player", "admin-add-guest", "admin-create-guest-invite", "admin-update-player", "admin-update-guest", "admin-promote-guest", "admin-assign-guest", "admin-remove-player", "admin-reset-player-pin", "admin-set-eoi", "admin-reject-waitlist", "admin-set-attendance", "admin-set-payment", "admin-update-score", "admin-delete-score", "admin-delete-media", "admin-send-push", "admin-save-alert-schedule", "admin-delete-alert-schedule", "admin-save-badge", "admin-delete-badge", "admin-duplicate-event"].includes(action)) {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
+    if (action === "admin-add-score") return runAudited(req, action, body, () => submitScore(body, true));
     if (action === "admin-change-passcode") return changePasscode(body);
-    if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body));
+    if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body, req));
     if (action === "admin-save-location") return runAudited(req, action, body, () => saveLocation(body));
     if (action === "admin-delete-event") return runAudited(req, action, body, () => deleteEvent(body));
     if (action === "admin-add-player") return runAudited(req, action, body, () => addPlayer(body));

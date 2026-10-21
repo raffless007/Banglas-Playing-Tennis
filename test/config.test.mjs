@@ -42,7 +42,7 @@ test("live point retries are idempotent and schema-backed", () => {
 test("startup failures cannot leave the loading overlay covering the app", () => {
   assert.match(index, /catch\(error\).*loading.*classList\.add\('hidden'\)/s);
   assert.match(index, /setInterval\(pollSyncVersion,300000\)/);
-  assert.match(sw, /bpt-shell-v3/);
+  assert.match(sw, /bpt-shell-v5/);
 });
 
 test("high-risk production constants are not accidentally reduced", () => {

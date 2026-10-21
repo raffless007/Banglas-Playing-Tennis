@@ -11,7 +11,7 @@ const playerId = "test-player";
 const sessionId = "test-session";
 
 function token(type) {
-  const payload = Buffer.from(JSON.stringify({ type, sub: playerId, sid: sessionId, iat: Date.now(), exp: Date.now() + 3600000 })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ type, sub: type === "player" ? playerId : undefined, sid: sessionId, iat: Date.now(), exp: Date.now() + 3600000 })).toString("base64url");
   return `${payload}.${crypto.createHmac("sha256", secret).update(payload).digest("base64url")}`;
 }
 
@@ -38,7 +38,7 @@ function fixture(source = apiSource, delay = 0) {
     if (table === "player_badge_states") rows = state.previousBadges;
     return new Response(JSON.stringify(rows));
   };
-  const body = source.replace(/^import[\s\S]*?;\n/gm, "").replace(/^export \{[^}]*\};/gm, "").replace("export default async (req) =>", "return async (req) =>");
+  const body = source.replace(/^import[\s\S]*?;\n/gm, "").replace(/^export \{[^}]*\};/gm, "").replace(/export default async \(req(?:, context = \{\})?\) =>/, "return async (req, context = {}) =>");
   const handler = new Function("deps", `const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process}=deps;\n${body}`)({
     ...crypto, fetch,
     process: { env: { SUPABASE_URL: "https://synthetic.invalid", SUPABASE_SERVICE_ROLE_KEY: "synthetic", ADMIN_SESSION_SECRET: secret } },
