@@ -1,0 +1,158 @@
+{
+  "capturedAt": "2026-10-21T06:36:00.299Z",
+  "sessionAgeSeconds": 62,
+  "viewport": {
+    "width": 390,
+    "height": 844
+  },
+  "shell": {
+    "responseMs": 6,
+    "domReadyMs": 99
+  },
+  "entries": [
+    {
+      "type": "request",
+      "action": "state",
+      "method": "GET",
+      "ms": 7,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "render",
+      "page": "play",
+      "ms": 3.6
+    },
+    {
+      "type": "request",
+      "action": "notification-state",
+      "method": "GET",
+      "ms": 9,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "render",
+      "page": "play",
+      "ms": 1.8
+    },
+    {
+      "type": "request",
+      "action": "realtime-config",
+      "method": "GET",
+      "ms": 2,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "render",
+      "page": "scores",
+      "ms": 3.3
+    },
+    {
+      "type": "render",
+      "page": "profiles",
+      "ms": 0.8
+    },
+    {
+      "type": "render",
+      "page": "media",
+      "ms": 0.8
+    },
+    {
+      "type": "request",
+      "action": "media-state",
+      "method": "GET",
+      "ms": 5,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "render",
+      "page": "payments",
+      "ms": 1.7
+    },
+    {
+      "type": "render",
+      "page": "admin",
+      "ms": 0.2
+    },
+    {
+      "type": "request",
+      "action": "admin-login",
+      "method": "POST",
+      "ms": 3,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "request",
+      "action": "admin-state",
+      "method": "GET",
+      "ms": 3,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "request",
+      "action": "state",
+      "method": "GET",
+      "ms": 6,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    },
+    {
+      "type": "render",
+      "page": "admin",
+      "ms": 0.2
+    },
+    {
+      "type": "request",
+      "action": "notification-state",
+      "method": "GET",
+      "ms": 11,
+      "status": 200,
+      "serverTiming": [
+        {
+          "stage": "synthetic",
+          "ms": 25
+        }
+      ]
+    }
+  ]
+}

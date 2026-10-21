@@ -591,40 +591,57 @@ async function savePasscode(passcode) {
   });
 }
 
-async function appState(req) {
-  // Keep weekly-event maintenance off the critical path. Existing events are
-  // already enough to render the clubhouse; only wait and re-read if the
-  // response genuinely has no current upcoming Wednesday to show.
-  const ensurePromise = ensureUpcomingEvents().catch(error => {
-    console.error("Upcoming event maintenance failed", error?.message || error);
-    return null;
-  });
-  const adminPromise = isAdminSession(req);
+async function appState(req, timings = []) {
+  const timed = async (name, promise) => {
+    const started = performance.now();
+    try { return await promise; }
+    finally { timings.push(`${name};dur=${(performance.now() - started).toFixed(1)}`); }
+  };
+  const adminPromise = timed("admin_session", isAdminSession(req));
   const candidatePlayerId = playerSessionSubject(req);
-  const playerValidationPromise = candidatePlayerId
+  const hasCredentials = Boolean(candidatePlayerId || adminTokenPayload(req));
+  const playerValidationPromise = timed("player_session", candidatePlayerId
     ? isPlayer(req, candidatePlayerId)
-    : Promise.resolve(false);
+    : Promise.resolve(false));
+  const playerRowsPromise = timed("roster", db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"));
+  // Start signing as soon as the roster arrives. Storage previously began
+  // only after the slowest state table returned, adding a serial stage.
+  const avatarsPromise = playerRowsPromise.then(rows => timed("avatars", Promise.all((rows || []).map(async player => [
+    player.id, player.avatar_path ? await mediaUrlForState(player.avatar_path) : null,
+  ])))).catch(() => []);
+  // A signed-out chooser only needs the roster. Do not fetch private history
+  // or generate weekly events for a request that cannot use that data.
   let [playerRows, events, eois, payments, scores, liveMatches, notes, badges, locations] = await Promise.all([
-    db("players?select=id,name,active,is_guest,guest_event_id,guest_of_player_id,email,mobile,address,avatar_path,pin_hash&order=name.asc"),
-    listVisibleEvents(),
-    db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at"),
-    db("payments?select=event_id,player_id,amount,paid,paid_at"),
-    db("match_scores?select=*&order=created_at.asc"),
-    db("live_matches?select=*&order=updated_at.desc"),
-    db("event_notes?select=*"),
-    db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => []),
-    listLocations(),
+    playerRowsPromise,
+    hasCredentials ? timed("events", listVisibleEvents()) : [],
+    hasCredentials ? timed("attendance", db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at")) : [],
+    hasCredentials ? timed("payments", db("payments?select=event_id,player_id,amount,paid,paid_at")) : [],
+    hasCredentials ? timed("scores", db("match_scores?select=*&order=created_at.asc")) : [],
+    hasCredentials ? timed("live", db("live_matches?select=*&order=updated_at.desc")) : [],
+    hasCredentials ? timed("notes", db("event_notes?select=*")) : [],
+    hasCredentials ? timed("badges", db("badges?enabled=eq.true&select=*&order=sort_order.asc,name.asc").catch(() => [])) : [],
+    hasCredentials ? timed("locations", listLocations()) : [],
   ]);
-  const expectedUpcoming = new Set(upcomingWednesdays());
-  if (!(events || []).some(event => expectedUpcoming.has(event.event_date))) {
-    await ensurePromise;
-    events = await listVisibleEvents();
-  }
-  events = hydrateEventLocations(events, locations);
   const admin = await adminPromise;
   const hasPlayerToken = Boolean(req.headers.get("x-player-session"));
   const playerId = !admin && candidatePlayerId && await playerValidationPromise ? candidatePlayerId : null;
-  const players = await Promise.all((playerRows || []).map(async player => ({
+  const authenticated = admin || Boolean(playerId);
+  const expectedUpcoming = upcomingWednesdays();
+  if (authenticated && Date.now() - upcomingEnsuredAt >= 5 * 60_000 && expectedUpcoming.some(date => !(events || []).some(event => event.event_date === date))) {
+    const maintenance = timed("weekly_maintenance", ensureUpcomingEvents().catch(error => {
+      console.error("Upcoming event maintenance failed", error?.message || error);
+    }));
+    // Preserve the existing non-blocking maintenance behavior whenever there
+    // is already a current session to display. Intentionally deleted dates
+    // must not make each cold request wait for an unnecessary second read.
+    if (!(events || []).some(event => expectedUpcoming.includes(event.event_date))) {
+      await maintenance;
+      events = await listVisibleEvents();
+    }
+  }
+  events = hydrateEventLocations(events, locations);
+  const avatars = new Map(await avatarsPromise);
+  const players = (playerRows || []).map(player => ({
     id: player.id,
     name: player.name,
     active: player.active,
@@ -634,9 +651,9 @@ async function appState(req) {
     pin_configured: Boolean(player.pin_hash),
     email: player.email || "",
     mobile: player.mobile || "",
-    avatar_url: player.avatar_path ? await mediaUrlForState(player.avatar_path) : null,
+    avatar_url: avatars.get(player.id) || null,
     ...(admin || player.id === playerId ? { address: player.address || "" } : {}),
-  })));
+  }));
   const visiblePayments = payments.map(payment => {
     if (admin || payment.player_id === playerId) return payment;
     // Payment timestamps are intentionally visible to every authenticated
@@ -658,7 +675,6 @@ async function appState(req) {
     // The inbox loads immediately after the clubhouse has painted.
     void createPlayerNotifications(pending).catch(() => {});
   }
-  const authenticated = admin || Boolean(playerId);
   const publicEvents = admin ? events : events.map(event => (new Date(localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) < new Date() ? { ...event, entry_pin: null } : event));
   return { players, events: authenticated ? publicEvents : [], eois: authenticated ? eois : [], payments: authenticated ? visiblePayments : [], scores: authenticated ? scores : [], liveMatches: authenticated ? liveMatches : [], notes: authenticated ? notes : [], badges: authenticated ? badges : [], notifications, sessionPlayerId: playerId, sessionExpired: hasPlayerToken && !playerId && !admin, mediaLimit: MEDIA_TOTAL_BYTES, serverNow: new Date().toISOString() };
 }
@@ -2581,7 +2597,12 @@ export default async (req) => {
       return reply({ error: "Too many PIN setup requests for this player. Please try again later." }, 429, { "retry-after": "900" });
     }
 
-    if (req.method === "GET" && action === "state") return reply(await appState(req));
+    if (req.method === "GET" && action === "state") {
+      const timings = [], started = performance.now();
+      const state = await appState(req, timings);
+      timings.push(`state_total;dur=${(performance.now() - started).toFixed(1)}`);
+      return reply(state, 200, { "Server-Timing": timings.join(", "), "Cache-Control": "private, no-store" });
+    }
     if (req.method === "GET" && action === "notification-state") return playerNotificationState(req);
     if (req.method === "GET" && action === "media-state") return mediaState(req);
     if (req.method === "GET" && action === "live-state") return liveState();
