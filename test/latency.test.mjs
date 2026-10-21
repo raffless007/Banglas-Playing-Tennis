@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 
 const apiSource = await readFile(new URL("../netlify/functions/api.mjs", import.meta.url), "utf8");
-const index = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const index = `${await readFile(new URL("../public/index.html", import.meta.url), "utf8")}\n${await readFile(new URL("../public/js/app.js", import.meta.url), "utf8")}`;
 const secret = "isolated-latency-test-secret";
 const playerId = "test-player";
 const sessionId = "test-session";
@@ -17,7 +17,7 @@ function token(type) {
 
 // Execute the actual handler with synthetic external boundaries. This never
 // reads production credentials, sends network requests, or writes a database.
-function fixture(source = apiSource, delay = 0) {
+function fixture(source = apiSource, delay = 0, fixtureOptions = {}) {
   const calls = [];
   const state = { revoked: false, active: true, pinUpdatedAt: null, lastSeen: new Date().toISOString(), previousBadges: [] };
   const events = Array.from({ length: 40 }, (_, offset) => {
@@ -29,18 +29,24 @@ function fixture(source = apiSource, delay = 0) {
     const table = url.pathname.split("/").at(-1);
     const method = options.method || "GET";
     calls.push({ table, method, query: url.searchParams.toString(), started: performance.now() });
-    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    const wait = typeof delay === 'function' ? delay(table, method) : delay;
+    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
     if (method !== "GET") return new Response("");
     let rows = [];
-    if (table === "players") rows = state.active ? [{ id: playerId, name: "Synthetic player", active: true, pin_hash: "configured", pin_updated_at: state.pinUpdatedAt }] : [];
+    if (table === "players") rows = state.active ? [{ id: playerId, name: "Synthetic player", active: true, pin_hash: "configured", pin_updated_at: state.pinUpdatedAt, avatar_path: fixtureOptions.avatarPath || null }] : [];
     if (["admin_sessions", "player_sessions"].includes(table)) rows = state.revoked ? [] : [{ session_id: sessionId, last_seen_at: state.lastSeen }];
     if (table === "events") rows = events;
     if (table === "player_badge_states") rows = state.previousBadges;
     return new Response(JSON.stringify(rows));
   };
   const body = source.replace(/^import[\s\S]*?;\n/gm, "").replace(/^export \{[^}]*\};/gm, "").replace(/export default async \(req(?:, context = \{\})?\) =>/, "return async (req, context = {}) =>");
-  const handler = new Function("deps", `const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process}=deps;\n${body}`)({
+  const handler = new Function("deps", `const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process,createClient}=deps;\n${body}`)({
     ...crypto, fetch,
+    createClient: () => ({ storage: { from: () => ({ createSignedUrl: async () => {
+      calls.push({ table: 'storage', method: 'SIGN', started: performance.now() });
+      await new Promise(resolve => setTimeout(resolve, fixtureOptions.storageDelay || 0));
+      return { data: { signedUrl: 'https://synthetic.invalid/avatar.jpg' } };
+    } }) } }),
     process: { env: { SUPABASE_URL: "https://synthetic.invalid", SUPABASE_SERVICE_ROLE_KEY: "synthetic", ADMIN_SESSION_SECRET: secret } },
   });
   function request(action, type, method = "GET", body) {
@@ -199,6 +205,57 @@ test("admin validation overlaps the state data fetches", async () => {
   assert.ok(Math.abs(auth.started - history.started) < 10, "State queries must not wait behind auth round trips");
 });
 
+test("signed-out state fetches only the roster and never runs event maintenance", async () => {
+  const app = fixture();
+  const response = await app.request('state');
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.ok(result.players.length);
+  for (const key of ['events','eois','payments','scores','liveMatches','notes','badges']) assert.deepEqual(result[key], []);
+  assert.deepEqual(app.calls.map(call => [call.table, call.method]), [['players', 'GET']]);
+  assert.match(response.headers.get('Server-Timing'), /roster;dur=[\d.]+/);
+  assert.match(response.headers.get('Server-Timing'), /state_total;dur=[\d.]+/);
+  assert.equal(response.headers.get('Cache-Control'), 'private, no-store');
+});
+
+test("complete upcoming weeks do not cause redundant event upserts", async () => {
+  const app = fixture();
+  assert.equal((await app.request('state', 'player')).status, 200);
+  assert.equal(app.calls.filter(call => call.table === 'events' && call.method !== 'GET').length, 0);
+  assert.equal(app.calls.filter(call => call.table === 'deleted_event_dates').length, 0);
+});
+
+test("avatar signing overlaps slow state reads instead of adding another serial stage", async t => {
+  const baseline = execFileSync('git', ['show','4752730:netlify/functions/api.mjs'], {cwd:new URL('..',import.meta.url),encoding:'utf8'});
+  const results = [];
+  for (const [label, source] of [['baseline',baseline],['candidate',apiSource]]) {
+    const app = fixture(source, table => table === 'match_scores' ? 100 : 5, {avatarPath:'synthetic/avatar.jpg',storageDelay:80});
+    const started = performance.now();
+    const response = await app.request('state','player');
+    assert.equal(response.status,200);
+    assert.equal((await response.json()).players[0].avatar_url,'https://synthetic.invalid/avatar.jpg');
+    const storage = app.calls.find(call => call.table === 'storage');
+    const scoreRead = app.calls.find(call => call.table === 'match_scores');
+    results.push({label,ms:Math.round(performance.now()-started),signingStartedAfterScoresMs:Math.round(storage.started-scoreRead.started)});
+  }
+  assert.ok(results[0].signingStartedAfterScoresMs >= 90);
+  assert.ok(results[1].signingStartedAfterScoresMs < 80, 'Storage must begin while the slow table request is still in flight');
+  t.diagnostic(`Controlled synthetic comparison, not production latency: ${JSON.stringify(results)}`);
+});
+
+test("performance diagnostics preserve fetch results and omit credentials and bodies", async () => {
+  const source=await readFile(new URL('../public/js/performance.js',import.meta.url),'utf8');
+  const secretHeader={'x-player-session':'never-collect-this-token'};
+  const response=new Response('{}',{headers:{'Server-Timing':'roster;dur=12.5, state_total;dur=42'}});
+  const window={fetch:async(input,options)=>{assert.equal(options.headers,secretHeader);return response;}};
+  new Function('window','location','performance','innerWidth','innerHeight',source)(window,{origin:'https://synthetic.invalid'},performance,390,844);
+  for(let i=0;i<65;i++)assert.equal(await window.fetch('/.netlify/functions/api?action=state&playerId=private-id',{headers:secretHeader}),response);
+  const snapshot=window.BPTPerformance.snapshot();
+  assert.equal(snapshot.entries.length,60);
+  assert.equal(snapshot.entries[0].serverTiming[0].ms,12.5);
+  assert.doesNotMatch(JSON.stringify(snapshot),/never-collect|private-id|headers|playerId/);
+});
+
 test("live realtime updates fetch only live state; durable changes still refresh", () => {
   const source = index.slice(index.indexOf("    function handleRealtimeChange("), index.indexOf("    function setupRealtimeSync("));
   const calls = [];
@@ -221,6 +278,16 @@ test("hidden or signed-out pages do not issue live and EOI polls", async () => {
     const polls = new Function("context", `with(context){${live}\n${eoi};return [pollLiveState,pollEoiState];}`)(context);
     for (const poll of polls) await poll();
   }
+});
+
+test("viewing the leaderboard skips live-only polling and live messages do not rerender it", async () => {
+  const source=index.slice(index.indexOf('    async function pollLiveState('),index.indexOf('    setInterval(pollLiveState,'));
+  let calls=0,renders=0;
+  const context={document:{visibilityState:'visible'},playerToken:'synthetic',adminToken:null,livePollInFlight:false,livePointPending:new Map(),scoreSubtab:'leaderboard',data:{liveMatches:[]},$:()=>({classList:{contains:()=>true}}),request:async()=>{calls++;return {liveMatches:[{id:'live-1',updated_at:'now'}]};},renderScores:()=>renders++};
+  const poll=new Function('context',`with(context){${source};return pollLiveState;}`)(context);
+  await poll();assert.equal(calls,0);
+  await poll(true);assert.equal(calls,1);assert.equal(context.data.liveMatches.length,1);assert.equal(renders,0);
+  context.scoreSubtab='scores';context.data.liveMatches=[];await poll();assert.equal(calls,2);assert.equal(renders,1);
 });
 
 test("synthetic before/after latency comparison", async t => {

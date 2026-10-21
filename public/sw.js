@@ -1,7 +1,7 @@
 // Bump the shell when the runtime changes so devices discard the failed
 // release instead of reusing its HTML or helper assets.
-const SHELL_CACHE = "bpt-shell-v5";
-const SHELL_ASSETS = ["/", "/manifest.webmanifest", "/js/scoring-reliability.js", "/js/experience-utils.js", "/js/a11y-enhancements.js", "/assets/tennis-app-icon.png"];
+const SHELL_CACHE = "bpt-shell-v6";
+const SHELL_ASSETS = ["/", "/manifest.webmanifest", "/css/app.css", "/css/mobile-first.css", "/js/app.js", "/js/scoring-reliability.js", "/js/mobile-first.js", "/js/performance.js", "/js/experience-utils.js", "/js/a11y-enhancements.js", "/assets/tennis-app-icon.png"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(SHELL_CACHE).then(cache => cache.addAll(SHELL_ASSETS)).then(() => self.skipWaiting()));

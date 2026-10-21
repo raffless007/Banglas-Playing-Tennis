@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const index = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const runtime = await readFile(new URL("../public/js/app.js", import.meta.url), "utf8");
+const index = `${html}\n${runtime}`;
 const api = await readFile(new URL("../netlify/functions/api.mjs", import.meta.url), "utf8");
 const sw = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url), "utf8");
@@ -42,7 +44,9 @@ test("live point retries are idempotent and schema-backed", () => {
 test("startup failures cannot leave the loading overlay covering the app", () => {
   assert.match(index, /catch\(error\).*loading.*classList\.add\('hidden'\)/s);
   assert.match(index, /setInterval\(pollSyncVersion,300000\)/);
-  assert.match(sw, /bpt-shell-v5/);
+  assert.match(sw, /bpt-shell-v6/);
+  assert.match(sw, /\/js\/scoring-reliability\.js/);
+  assert.match(sw, /\/css\/mobile-first\.css/);
 });
 
 test("high-risk production constants are not accidentally reduced", () => {
@@ -124,12 +128,8 @@ test("payment-timed badges wait for the full deadline before evaluating", () => 
   assert.match(index, /paymentRateWithin=hours=>[\s\S]*row\.paymentWindowPending\(cutoff\)\)return null/);
 });
 
-test("the inline app script remains valid JavaScript", () => {
-  const inlineScripts = [...index.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
-    .map((match) => match[1])
-    .filter((source) => source.trim());
-  assert.ok(inlineScripts.length, "Expected an inline app script.");
-  for (const source of inlineScripts) {
-    assert.doesNotThrow(() => new Function(source));
-  }
+test("the extracted app script remains valid and loads before the presentation layer", () => {
+  assert.match(html, /<script src="\/js\/app\.js"><\/script>\s*<script src="\/js\/scoring-reliability\.js"><\/script>\s*<script src="\/js\/mobile-first\.js"><\/script>/);
+  assert.ok(html.length < 25000, "The HTML shell should not carry the full app runtime");
+  assert.doesNotThrow(() => new Function(runtime));
 });
