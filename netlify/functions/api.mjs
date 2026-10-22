@@ -1178,6 +1178,12 @@ async function markPaid(body) {
   if (new Date() < localDateTimeToUtc(event.event_date, eventEndTime(event), event.timezone)) return reply({ error: "Payments open after the game finishes." }, 409);
   const attending = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
   if (!attending.some(row => row.player_id === body.playerId)) return reply({ error: "Only players marked In can confirm payment." }, 403);
+  if (body.paid === false) {
+    await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+    return reply({ ok: true, paid: false });
+  }
   const existingPayment = (await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=amount`))?.[0] || null;
   const calculatedAmount = Number((totalCourtFee(event) / attending.length + Number(event.ball_fee)).toFixed(2));
   const amount = Number.isFinite(Number(existingPayment?.amount)) ? Number(existingPayment.amount) : calculatedAmount;
@@ -1401,10 +1407,9 @@ async function addLivePoint(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
-  const event = await getEvent(match.event_id);
+  const [event, attending] = await Promise.all([getEvent(match.event_id), attendingSet(match.event_id, body.playerId)]);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
-  const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
   const actionId = String(body.actionId || "").trim();
@@ -1538,24 +1543,21 @@ async function finishLiveMatch(body, adminOverride = false) {
     if (alreadySaved?.length) return reply({ ok: true, alreadySaved: true });
     return reply({ error: "Live match not found." }, 404);
   }
-  const event = await getEvent(match.event_id);
+  const [event, attending, existingSaved] = await Promise.all([
+    getEvent(match.event_id),
+    attendingSet(match.event_id, body.playerId),
+    db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=id`),
+  ]);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
-  const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
-  const existingSaved = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=id`);
   if (existingSaved?.length) {
     await cleanupLiveMatch(match.id, existingSaved[0].id);
     return reply({ ok: true, alreadySaved: true });
   }
   const endedAt = new Date().toISOString();
   const durationSeconds = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(match.started_at || match.created_at).getTime()) / 1000));
-  await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.true`, {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ ended_at: endedAt, duration_seconds: durationSeconds, updated_at: endedAt }),
-  });
   let savedRows = null;
   try {
     savedRows = await db("match_scores", {

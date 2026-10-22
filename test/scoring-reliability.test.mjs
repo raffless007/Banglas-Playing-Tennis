@@ -6,6 +6,7 @@ import vm from 'node:vm';
 
 const source=await readFile(new URL('../netlify/functions/api.mjs',import.meta.url),'utf8');
 const client=await readFile(new URL('../public/js/scoring-reliability.js',import.meta.url),'utf8');
+const appSource=await readFile(new URL('../public/js/app.js',import.meta.url),'utf8');
 const owner='34997eec-ac2e-46c0-8473-816733ef0df5', participant='11111111-1111-4111-a111-111111111111';
 const other='22222222-2222-4222-a222-222222222222', fourth='33333333-3333-4333-a333-333333333333';
 const secret='synthetic-reliability-secret';
@@ -159,4 +160,15 @@ test('client score deadline uses venue time and skips cancelled sessions',()=>{
   const app=clientFixture();
   app.context.data.events=[{id:'old',event_date:'2026-10-14',start_time:'20:00:00',timezone:'Australia/Sydney'},{id:'cancelled',event_date:'2026-10-21',start_time:'20:00:00',cancellation_status:'cancelled'},{id:'next',event_date:'2026-10-28',start_time:'19:30:00',timezone:'Australia/Sydney'}];
   assert.equal(app.context.scoringClosesFor(app.context.data.events[0]).toISOString(),'2026-10-28T08:30:00.000Z');
+});
+
+test('live match reconciliation recognizes a saved result after its live row is cleaned up',()=>{
+  const start='2026-10-21T09:00:00.000Z',match={id:'live-1',event_id:'old',started_at:start,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2};
+  const from=appSource.indexOf('function liveScoreAlreadySaved'),to=appSource.indexOf('function formatLiveDuration',from);
+  assert.ok(from>=0&&to>from,'live reconciliation helpers should remain present');
+  const context={data:{liveMatches:[match],scores:[]}};vm.createContext(context);
+  vm.runInContext(`${appSource.slice(from,to)};this.isSaved=liveScoreAlreadySaved;this.unsaved=unsavedLiveMatches;`,context);
+  assert.equal(context.isSaved(match),false);assert.equal(context.unsaved().length,1);
+  context.data.scores.push({event_id:'old',started_at:start,team_a_player_ids:[other,participant],team_b_player_ids:[fourth,owner],games_a:4,games_b:2});
+  assert.equal(context.isSaved(match),true);assert.equal(context.unsaved().length,0);
 });

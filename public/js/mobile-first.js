@@ -38,7 +38,69 @@
   renderActivePage = function(...args) {
     const started = performance.now();
     try { return originalRenderActivePage(...args); }
-    finally { window.BPTPerformance?.recordRender(activePage, performance.now() - started); }
+    finally { enhanceSessionSelectors(document); window.BPTPerformance?.recordRender(activePage, performance.now() - started); }
+  };
+
+  function enhanceSessionSelectors(root = document) {
+    if (!root) return;
+    const selectorIds = ['scoreWeekSelect', 'paymentWeekSelect', 'adminScoreWeek', 'adminPaymentWeek', 'adminEoiWeek', 'manualPushEvent', 'mobileAdminEvent'];
+    for (const id of selectorIds) {
+      const select = root.querySelector?.(`#${id}`);
+      if (!select || select.dataset.sessionLabelled === 'true') continue;
+      select.dataset.sessionLabelled = 'true';
+      select.classList.add('session-picker');
+      const label = select.closest('label');
+      const caption = label?.querySelector('.label');
+      if (caption) caption.textContent = id === 'manualPushEvent' ? 'SESSION LINK (OPTIONAL)' : 'SESSION';
+      else {
+        const wrapper = document.createElement('label');
+        wrapper.className = 'session-picker-wrap';
+        wrapper.innerHTML = '<span class="label">SESSION</span>';
+        select.before(wrapper);
+        wrapper.append(select);
+      }
+      for (const option of select.options) {
+        const event = data.events.find(item => item.id === option.value);
+        if (!event || option.disabled || !option.value) continue;
+        const date = fmt(new Date(`${event.event_date}T12:00:00`), { weekday: 'short', day: 'numeric', month: 'short' });
+        const count = id === 'scoreWeekSelect' ? ` · ${(data.scores || []).filter(score => score.event_id === event.id).length} matches` : '';
+        option.textContent = `${date} · ${sessionStatus(event)}${count}`;
+      }
+    }
+  }
+
+  const originalAdmin = renderAdmin;
+  renderAdmin = function(...args) {
+    const result = originalAdmin(...args);
+    enhanceSessionSelectors(document.getElementById('dashboard') || document);
+    const adminLogin = document.getElementById('profileAdminUnlock');
+    if (adminLogin && adminLogin.parentElement?.id === 'adminLock') adminLogin.parentElement.append(adminLogin);
+    return result;
+  };
+  const originalAdminScores = renderAdminScores;
+  renderAdminScores = function(...args) { const result = originalAdminScores(...args); enhanceSessionSelectors(document.getElementById('adminScoresPanel')); return result; };
+  const originalAdminEois = renderAdminEois;
+  renderAdminEois = function(...args) { const result = originalAdminEois(...args); enhanceSessionSelectors(document.getElementById('eoisPanel')); return result; };
+  const originalAdminMoney = renderMoney;
+  renderMoney = function(...args) { const result = originalAdminMoney(...args); enhanceSessionSelectors(document.getElementById('moneyPanel')); return result; };
+  const originalRenderPayment = renderPayment;
+  renderPayment = function(...args) {
+    const result = originalRenderPayment(...args);
+    enhanceSessionSelectors(document.getElementById('paymentsPage'));
+    const info = paymentInfo(paymentEventId);
+    const confirmation = document.querySelector('#paymentCard > .paid');
+    if (info?.payment?.paid && confirmation && !confirmation.querySelector('[data-undo-payment]')) {
+      confirmation.classList.add('paid-confirmation');
+      const undo = document.createElement('button');
+      undo.type = 'button'; undo.className = 'secondary'; undo.dataset.undoPayment = 'true'; undo.textContent = 'Undo';
+      undo.onclick = () => markPaid(info.event.id, false);
+      confirmation.append(undo);
+    }
+    return result;
+  };
+  markPaid = async function(eventId, paid = true) {
+    try { await request('paid', 'POST', { eventId, playerId: currentPlayerId, paid }); notify(paid ? 'Payment confirmed' : 'Payment marked unpaid'); await refresh(); }
+    catch (error) { notify(error.message); }
   };
   const originalSettings = renderSettings;
   renderSettings = function(...args) {
@@ -69,6 +131,37 @@
     }
     return result;
   };
+  const baseAdminEventLocationLink = renderAdminEvents;
+  renderAdminEvents = function(...args) {
+    const result = baseAdminEventLocationLink(...args);
+    const locationInput = document.getElementById('editLocation'), suburbInput = document.getElementById('editSuburb'), select = document.getElementById('editLocationId');
+    if (!locationInput || !select || select.dataset.autoLinkReady === 'true') return result;
+    select.dataset.autoLinkReady = 'true';
+    const normalize = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const linkBestMatch = () => {
+      const query = normalize(locationInput.value), suburb = normalize(suburbInput?.value);
+      if (!query) return;
+      const words = query.split(' ').filter(word => !['court', 'courts', 'tennis', 'the'].includes(word));
+      const candidates = [...select.options].slice(1).map(option => {
+        const row = adminLocations.find(item => item.id === option.value);
+        if (!row || row.active === false) return null;
+        const name = normalize(row.name), nameWords = name.split(' ').filter(word => !['court', 'courts', 'tennis', 'the'].includes(word));
+        const overlap = words.filter(word => nameWords.includes(word)).length;
+        const sameSuburb = suburb && normalize(row.suburb) === suburb;
+        const civicDefault = words.includes('civic') && words.includes('park') && name.includes('civic') && name.includes('tennis') && sameSuburb;
+        const score = civicDefault ? 100 : (normalize(locationInput.value) === name ? 90 : overlap * 10 + (sameSuburb ? 4 : 0));
+        return { row, score, overlap };
+      }).filter(Boolean).sort((a, b) => b.score - a.score);
+      const best = candidates[0];
+      if (!best || (!best.score || (best.overlap === 0 && best.score < 90))) return;
+      select.value = best.row.id;
+      select.onchange?.();
+    };
+    locationInput.addEventListener('change', linkBestMatch);
+    suburbInput?.addEventListener('change', linkBestMatch);
+    if (!select.value) linkBestMatch();
+    return result;
+  };
 
   const playHero = document.querySelector('#playPage .hero');
   if (playHero) {
@@ -79,30 +172,12 @@
     const tools = document.getElementById('eventQuickActions');
     const side = document.querySelector('#playPage .side');
     if (tools && side) {
-      tools.className = 'quick-tools';
-      tools.setAttribute('aria-label', 'Session shortcuts');
+      tools.className = 'event-utilities';
+      tools.setAttribute('aria-label', 'Session utilities');
       const directions = document.getElementById('directionsBtn');
       const calendar = document.getElementById('itineraryBtn');
       if (directions) labelButton(directions, 'directions', 'Directions');
       if (calendar) labelButton(calendar, 'calendar', 'Calendar');
-      for (const [target, graphic, text, leaderboard] of [
-        ['scores', 'live', 'Live scoring', false],
-        ['payments', 'payments', 'Payments', false],
-        ['scores', 'scores', 'Leaderboard', true],
-        ['media', 'media', 'Photos', false],
-      ]) {
-        const button = document.createElement('button');
-        button.type = 'button'; button.className = 'secondary';
-        labelButton(button, graphic, text);
-        button.onclick = () => {
-          if (target === 'scores') {
-            scoreSubtab = leaderboard ? 'leaderboard' : 'scores';
-            if (!leaderboard) scoreEventId = upcoming()[selected]?.id || scoreEventId;
-          }
-          go(target);
-        };
-        tools.insertBefore(button, directions || calendar || null);
-      }
       side.prepend(tools);
     }
     enhanceWeather();
@@ -121,7 +196,7 @@
     update(); weather.append(button);
   }
   const basePlay = renderPlay;
-  renderPlay = function(...args) { const result = basePlay(...args); enhancePlay(); return result; };
+  renderPlay = function(...args) { const result = basePlay(...args); enhancePlay(); const weeks = document.getElementById('weeks'); if (weeks) weeks.scrollLeft = 0; return result; };
   const weather = document.getElementById('weatherCard');
   if (weather) new MutationObserver(enhanceWeather).observe(weather, { childList: true });
 
@@ -151,7 +226,7 @@
     }
   }
   const baseScores = renderScores;
-  renderScores = function(...args) { const result = baseScores(...args); enhanceScores(); return result; };
+  renderScores = function(...args) { const result = baseScores(...args); enhanceScores(); enhanceSessionSelectors(document.getElementById('scoresPage')); return result; };
   const baseLiveCall = liveCall;
   liveCall = async function(action, ...args) {
     const result = await baseLiveCall(action, ...args);

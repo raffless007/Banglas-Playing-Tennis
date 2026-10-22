@@ -11,6 +11,9 @@ const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url)
 const badgePresets = await readFile(new URL("../supabase/migrations/045_badge_rule_presets.sql", import.meta.url), "utf8");
 const freshLegsMigration = await readFile(new URL("../supabase/migrations/047_fresh_legs_max_matches.sql", import.meta.url), "utf8");
 const badgeRangesMigration = await readFile(new URL("../supabase/migrations/048_badge_criteria_ranges.sql", import.meta.url), "utf8");
+const mobile = await readFile(new URL("../public/js/mobile-first.js", import.meta.url), "utf8");
+const mobileCss = await readFile(new URL("../public/css/mobile-first.css", import.meta.url), "utf8");
+const reliabilityClient = await readFile(new URL("../public/js/scoring-reliability.js", import.meta.url), "utf8");
 
 test("security headers and app entry points are present", async () => {
   const netlify = await readFile(new URL("../netlify.toml", import.meta.url), "utf8");
@@ -132,4 +135,16 @@ test("the extracted app script remains valid and loads before the presentation l
   assert.match(html, /<script src="\/js\/app\.js"><\/script>\s*<script src="\/js\/scoring-reliability\.js"><\/script>\s*<script src="\/js\/mobile-first\.js"><\/script>/);
   assert.ok(html.length < 25000, "The HTML shell should not carry the full app runtime");
   assert.doesNotThrow(() => new Function(runtime));
+});
+
+test("mobile UI polish preserves navigation and supports payment undo and linked venues", () => {
+  assert.match(mobile, /className = 'event-utilities'/);
+  assert.doesNotMatch(mobile, /\['scores', 'live', 'Live scoring'/);
+  assert.match(mobileCss, /#profilesBoard tbody\{display:grid;grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/);
+  assert.match(mobile, /data-undo-payment/);
+  assert.match(mobile, /markPaid = async function\(eventId, paid = true\)/);
+  assert.match(api, /if \(body\.paid === false\)[\s\S]*method: "DELETE"/);
+  assert.match(mobile, /civicDefault/);
+  assert.match(reliabilityClient, /Add New Score/);
+  assert.match(mobile, /option\.textContent = `\$\{date\} · \$\{sessionStatus\(event\)\}/);
 });

@@ -123,9 +123,10 @@
   renderAdminScores=function(...args){
     const result=baseAdminScores(...args), panel=$('adminScoresPanel');
     if(adminToken&&panel&&!panel.querySelector('#adminAddScore')){
-      const button=document.createElement('button');button.id='adminAddScore';button.className='primary';button.type='button';button.textContent='Add scores for this week';
+      const row=document.createElement('div');row.className='admin-add-score-row';
+      const button=document.createElement('button');button.id='adminAddScore';button.className='primary';button.type='button';button.textContent='Add New Score';
       button.onclick=()=>{rememberDrafts();scoreEventId=adminScoreEventId;scoreSubtab='scores';go('scores');document.querySelector('[data-score-save-help]')?.scrollIntoView({block:'start'});};
-      panel.querySelector('#adminScoreWeek')?.closest('label').after(button);
+      row.append(button);panel.querySelector('#adminScoreWeek')?.closest('label').after(row);
     }
     return result;
   };
