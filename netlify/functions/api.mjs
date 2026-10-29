@@ -12,7 +12,7 @@ import {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } from "@simplewebauthn/server";
-import { activePlayerIds, notifyPlayers, pushConfigured } from "./push.mjs";
+import { activePlayerIds, notifyPlayers, pushConfigured, RAFEED_PLAYER_ID } from "./push.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -137,6 +137,12 @@ async function createPlayerNotifications(rows) {
       body: JSON.stringify(payload.map(({ group_key, ...row }) => row)),
     });
   }
+}
+
+function notifyRafeed(req, { notificationType, notificationKey, title, body, url, eventId = null }) {
+  return afterResponse(req, () => notifyPlayers({
+    playerIds: [RAFEED_PLAYER_ID], notificationType, notificationKey, title, body, url, eventId, audience: "selected",
+  }));
 }
 
 async function notifyAdminWaitlist(event, player, position) {
@@ -1163,7 +1169,18 @@ async function submitEoi(body, req) {
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ event_id: body.eventId, player_id: body.playerId, status: body.status, waitlist_position: body.status === "yes" ? waitlistPosition : null, updated_at: new Date().toISOString() }),
   });
-  if (body.status === "yes" && Number.isInteger(waitlistPosition) && (!existing || existing.status !== "yes" || existing.waitlist_position == null)) {
+  const newlyWaitlisted = body.status === "yes" && Number.isInteger(waitlistPosition) && (!existing || existing.status !== "yes" || existing.waitlist_position == null);
+  const responseChanged = existing?.status !== body.status || (existing?.waitlist_position ?? null) !== waitlistPosition;
+  if (responseChanged && !newlyWaitlisted) {
+    const responseText = Number.isInteger(waitlistPosition) ? `joined the waitlist at position ${waitlistPosition}` : body.status === "yes" ? "is in" : "can't make it";
+    await notifyRafeed(req, {
+      notificationType: "eoi", notificationKey: `eoi-activity:${body.eventId}:${body.playerId}:${body.status}:${waitlistPosition ?? "none"}:${Date.now()}`,
+      title: `EOI updated · ${eventLabel(event)}`,
+      body: `A player ${responseText} for ${eventLabel(event)} at ${event.location}, ${event.suburb}.`,
+      url: `/?page=play&event=${encodeURIComponent(event.id)}`, eventId: event.id,
+    });
+  }
+  if (newlyWaitlisted) {
     await afterResponse(req, async () => {
       const player = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=name`))?.[0] || { name: "A player" };
       await notifyAdminWaitlist(event, player, waitlistPosition);
@@ -1535,7 +1552,7 @@ async function cleanupLiveMatch(matchId, scoreId = null) {
   }
 }
 
-async function finishLiveMatch(body, adminOverride = false) {
+async function finishLiveMatch(body, adminOverride = false, req = null) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) {
@@ -1559,6 +1576,7 @@ async function finishLiveMatch(body, adminOverride = false) {
   const endedAt = new Date().toISOString();
   const durationSeconds = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(match.started_at || match.created_at).getTime()) / 1000));
   let savedRows = null;
+  let insertedScore = false;
   try {
     savedRows = await db("match_scores", {
       method: "POST",
@@ -1582,6 +1600,7 @@ async function finishLiveMatch(body, adminOverride = false) {
         duration_seconds: durationSeconds,
       }),
     });
+    insertedScore = Boolean(savedRows?.length);
   } catch (error) {
     if (!/duplicate|unique/i.test(error?.message || "")) throw error;
     savedRows = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=*`);
@@ -1590,10 +1609,18 @@ async function finishLiveMatch(body, adminOverride = false) {
   const score = savedRows?.[0] || null;
   const scoreId = score?.id || null;
   await cleanupLiveMatch(match.id, scoreId);
+  if (insertedScore && score && req) {
+    await notifyRafeed(req, {
+      notificationType: "matches", notificationKey: `score-activity:live:${score.id}`,
+      title: `New score · ${eventLabel(event)}`,
+      body: `A live ${match.match_type === "singles" ? "singles" : "doubles"} result was saved for ${eventLabel(event)}.`,
+      url: `/?page=scores&event=${encodeURIComponent(event.id)}`, eventId: event.id,
+    });
+  }
   return reply({ ok: true, alreadySaved: !scoreId, score });
 }
 
-async function submitScore(body, adminOverride = false) {
+async function submitScore(body, adminOverride = false, req = null) {
   const event = await getEvent(body.eventId);
   if (!event || !body.submittedBy) return reply({ error: "Choose the session and the player recording this score." }, 404);
   const windowError = adminOverride ? "" : await manualScoringWindowError(event);
@@ -1648,6 +1675,15 @@ async function submitScore(body, adminOverride = false) {
     headers: { Prefer: submissionId ? "resolution=ignore-duplicates,return=representation" : "return=representation" },
     body: JSON.stringify(inserts),
   });
+  if (saved?.length && req) {
+    const scoreKey = submissionId || saved.map(row => row.id).filter(Boolean).join(",") || randomUUID();
+    await notifyRafeed(req, {
+      notificationType: "matches", notificationKey: `score-activity:${body.eventId}:${scoreKey}`,
+      title: `New score${saved.length === 1 ? "" : "s"} · ${eventLabel(event)}`,
+      body: `A player added ${saved.length} match score${saved.length === 1 ? "" : "s"} for ${eventLabel(event)}.`,
+      url: `/?page=scores&event=${encodeURIComponent(event.id)}`, eventId: event.id,
+    });
+  }
   return reply({ ok: true, saved: inserts.length, scores: saved || [], submissionId: submissionId || null });
 }
 
@@ -1798,7 +1834,7 @@ async function adminPlaceSearch(body) {
   }
 }
 
-async function adminRejectWaitlist(body) {
+async function adminRejectWaitlist(body, req) {
   if (!body.eventId || !body.playerId) return reply({ error: "Choose a waitlisted player." }, 400);
   const event = await getEvent(body.eventId);
   if (!event) return reply({ error: "Event not found." }, 404);
@@ -1810,6 +1846,7 @@ async function adminRejectWaitlist(body) {
   const message = `${eventLabel(event)} at ${event.location}, ${event.suburb} is full this week. Your waitlist request was not accepted; please try again next week.`;
   await createPlayerNotifications([{ player_id: body.playerId, event_id: event.id, notification_type: "eoi", title, body: message, url: `/?page=play&event=${encodeURIComponent(event.id)}`, dedupe_key: `waitlist-rejected:${event.id}:${body.playerId}` }]).catch(() => {});
   try { await notifyPlayers({ playerIds: [body.playerId], notificationType: "eoi", notificationKey: `waitlist-rejected:${event.id}:${body.playerId}`, eventId: event.id, title, body: message, url: `/?page=play&event=${encodeURIComponent(event.id)}`, audience: "selected" }); } catch (error) { console.error("Waitlist rejection push failed", error); }
+  await notifyRafeed(req, { notificationType: "eoi", notificationKey: `eoi-admin-rejected-waitlist:${event.id}:${body.playerId}`, title: `Waitlist updated · ${eventLabel(event)}`, body: `Admin declined ${player.name}'s waitlist request for ${eventLabel(event)} at ${event.location}, ${event.suburb}.`, url: `/?page=admin&event=${encodeURIComponent(event.id)}`, eventId: event.id });
   return reply({ ok: true, player: player.name });
 }
 
@@ -2157,19 +2194,28 @@ async function resetPlayerPin(body) {
   return reply({ ok: true });
 }
 
-async function adminSetEoi(body) {
+async function adminSetEoi(body, req) {
   if (!body.eventId || !body.playerId || !["yes", "no", "none"].includes(body.status)) {
     return reply({ error: "Choose a valid player and EOI status." }, 400);
   }
   if (body.status === "none") {
+    const existing = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=status`);
     await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
       method: "DELETE", headers: { Prefer: "return=minimal" },
     });
     await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
       method: "DELETE", headers: { Prefer: "return=minimal" },
     });
+    if (existing?.length && req) {
+      await afterResponse(req, async () => {
+        const event = await getEvent(body.eventId);
+        const playerName = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=name`))?.[0]?.name || "A player";
+        await notifyPlayers({ playerIds: [RAFEED_PLAYER_ID], notificationType: "eoi", notificationKey: `eoi-admin-activity:${body.eventId}:${body.playerId}:none:${Date.now()}`, title: `EOI changed · ${event ? eventLabel(event) : "Session"}`, body: `Admin removed ${playerName}'s response${event ? ` for ${eventLabel(event)} at ${event.location}, ${event.suburb}` : ""}.`, url: `/?page=admin&event=${encodeURIComponent(body.eventId)}`, eventId: body.eventId, audience: "selected" });
+      });
+    }
     return reply({ ok: true });
   }
+  const previous = await db(`eois?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}&select=status,waitlist_position`);
   await db("eois?on_conflict=event_id,player_id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -2184,6 +2230,13 @@ async function adminSetEoi(body) {
   if (body.status === "no") {
     await db(`payments?event_id=eq.${encodeURIComponent(body.eventId)}&player_id=eq.${encodeURIComponent(body.playerId)}`, {
       method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+  }
+  if ((!previous?.length || previous[0].status !== body.status || previous[0].waitlist_position != null) && req) {
+    await afterResponse(req, async () => {
+      const event = await getEvent(body.eventId);
+      const playerName = (await db(`players?id=eq.${encodeURIComponent(body.playerId)}&select=name`))?.[0]?.name || "A player";
+      await notifyPlayers({ playerIds: [RAFEED_PLAYER_ID], notificationType: "eoi", notificationKey: `eoi-admin-activity:${body.eventId}:${body.playerId}:${body.status}:${Date.now()}`, title: `EOI changed · ${event ? eventLabel(event) : "Session"}`, body: `Admin changed ${playerName}'s response to ${body.status === "yes" ? "In" : "Out"}${event ? ` for ${eventLabel(event)} at ${event.location}, ${event.suburb}` : ""}.`, url: `/?page=admin&event=${encodeURIComponent(body.eventId)}`, eventId: body.eventId, audience: "selected" });
     });
   }
   return reply({ ok: true });
@@ -2370,7 +2423,7 @@ async function updatePlayerProfile(body) {
   return reply({ ok: true, player });
 }
 
-async function finalizeMediaUpload(body) {
+async function finalizeMediaUpload(body, req) {
   const title = String(body.title || "").trim();
   const path = String(body.path || "");
   const originalName = String(body.originalName || "").trim();
@@ -2387,7 +2440,7 @@ async function finalizeMediaUpload(body) {
   if (!/^(image|video)\//.test(mimeType) || !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
     return reply({ error: "Invalid media type or date." }, 400);
   }
-  const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id`);
+  const players = await db(`players?id=eq.${encodeURIComponent(body.playerId)}&active=eq.true&select=id,name`);
   if (!players.length) return reply({ error: "Select an active player before uploading." }, 403);
   const segments = path.split("/");
   const fileName = segments.pop();
@@ -2398,9 +2451,9 @@ async function finalizeMediaUpload(body) {
     return reply({ error: "The uploaded file could not be verified." }, 409);
   }
   const storedSize = Number(storedItem.metadata?.size || fileSize);
-  await db("media_items", {
+  const mediaItems = await db("media_items", {
     method: "POST",
-    headers: { Prefer: "return=minimal" },
+    headers: { Prefer: "return=representation" },
     body: JSON.stringify({
       player_id: body.playerId,
       title,
@@ -2415,6 +2468,15 @@ async function finalizeMediaUpload(body) {
       consent_confirmed: true,
     }),
   });
+  if (mediaItems?.length && req) {
+    const mediaType = mimeType.startsWith("image/") ? "photo" : "video";
+    await notifyRafeed(req, {
+      notificationType: "matches", notificationKey: `gallery-activity:${mediaItems[0].id || path}`,
+      title: `New ${mediaType} in the gallery`,
+      body: `${players[0].name || "A player"} added “${title}” to the gallery.`,
+      url: "/?page=media",
+    });
+  }
   return reply({ ok: true });
 }
 
@@ -2704,16 +2766,16 @@ export default async (req, context = {}) => {
     }
     if (req.method === "POST" && action === "eoi") return runAudited(req, action, body, () => submitEoi(body, req));
     if (req.method === "POST" && action === "paid") return runAudited(req, action, body, () => markPaid(body));
-    if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body, adminSessionValid));
+    if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body, adminSessionValid, req));
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body, adminSessionValid);
     if (req.method === "POST" && action === "live-server") return updateLiveServer(body, adminSessionValid);
     if (req.method === "POST" && action === "live-point") return addLivePoint(body, adminSessionValid);
     if (req.method === "POST" && action === "live-undo") return undoLivePoint(body, adminSessionValid);
     if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body, adminSessionValid);
-    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body, adminSessionValid);
+    if (req.method === "POST" && action === "live-finish") return finishLiveMatch(body, adminSessionValid, req);
     if (req.method === "POST" && action === "event-note") return saveEventNote(body);
     if (req.method === "POST" && action === "media-upload-url") return createMediaUpload(body);
-    if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body);
+    if (req.method === "POST" && action === "media-finalize") return finalizeMediaUpload(body, req);
     if (req.method === "POST" && action === "media-report") return runAudited(req, action, body, () => reportMedia(body));
     if (req.method === "POST" && action === "media-delete") return runAudited(req, action, body, () => deleteOwnMedia(body));
     if (req.method === "POST" && action === "media-favorite") return runAudited(req, action, body, () => favoriteMedia(body));
@@ -2758,7 +2820,7 @@ export default async (req, context = {}) => {
       return reply({ error: "Unknown action." }, 404);
     }
     if (!adminSessionValid) return reply({ error: "Admin session expired." }, 401);
-    if (action === "admin-add-score") return runAudited(req, action, body, () => submitScore(body, true));
+    if (action === "admin-add-score") return runAudited(req, action, body, () => submitScore(body, true, req));
     if (action === "admin-change-passcode") return changePasscode(body);
     if (action === "admin-save-event") return runAudited(req, action, body, () => saveEvent(body, req));
     if (action === "admin-save-location") return runAudited(req, action, body, () => saveLocation(body));
@@ -2772,8 +2834,8 @@ export default async (req, context = {}) => {
     if (action === "admin-assign-guest") return runAudited(req, action, body, () => assignGuest(body));
     if (action === "admin-remove-player") return runAudited(req, action, body, () => removePlayer(body));
     if (action === "admin-reset-player-pin") return runAudited(req, action, body, () => resetPlayerPin(body));
-    if (action === "admin-set-eoi") return runAudited(req, action, body, () => adminSetEoi(body));
-    if (action === "admin-reject-waitlist") return runAudited(req, action, body, () => adminRejectWaitlist(body));
+    if (action === "admin-set-eoi") return runAudited(req, action, body, () => adminSetEoi(body, req));
+    if (action === "admin-reject-waitlist") return runAudited(req, action, body, () => adminRejectWaitlist(body, req));
     if (action === "admin-set-attendance") return runAudited(req, action, body, () => adminSetAttendance(body));
     if (action === "admin-set-payment") return runAudited(req, action, body, () => adminSetPayment(body));
     if (action === "admin-update-score") return runAudited(req, action, body, () => adminUpdateScore(body));

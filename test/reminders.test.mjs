@@ -12,7 +12,11 @@ class TestDate extends Date {
 }
 const event = (id, extra = {}) => ({ id, event_date: "2026-10-07", start_time: "19:30:00", end_time: "22:00:00", timezone: "Australia/Sydney", location: "Synthetic courts", suburb: "Test", court_fee: 54, ball_fee: 1, account_closed: false, cancellation_status: "scheduled", ...extra });
 
-function pushFixture(events, { attendees = true, paidIds = [], bodyTemplate = "{date}: {amount} at {location}" } = {}) {
+function pushFixture(events, { attendees = true, paidIds = [], bodyTemplate = "{date}: {amount} at {location}", nowMs = now } = {}) {
+  class FixtureDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [nowMs])); }
+    static now() { return nowMs; }
+  }
   const queries = [], notifications = [];
   const eois = attendees ? events.map(item => ({ event_id: item.id, player_id: "synthetic-player", status: "yes" })) : [];
   const db = async query => {
@@ -24,7 +28,7 @@ function pushFixture(events, { attendees = true, paidIds = [], bodyTemplate = "{
     throw new Error(`Unexpected synthetic query: ${query}`);
   };
   const source = pushSource.replace(/^import[^\n]*\n/, "").replace("export default async () =>", "return async () =>").replace("export const config", "const config");
-  const run = new Function("db", "activePlayerIds", "notifyPlayers", "pushConfigured", "Date", "fetch", source)(db, async () => ["synthetic-player"], async payload => notifications.push(payload), () => true, TestDate, () => assert.fail("Weather must not be fetched for deleted/cancelled events"));
+  const run = new Function("db", "activePlayerIds", "notifyPlayers", "pushConfigured", "RAFEED_PLAYER_ID", "Date", "fetch", source)(db, async () => ["synthetic-player"], async payload => notifications.push(payload), () => true, "rafeed-synthetic-id", FixtureDate, () => assert.fail("Weather must not be fetched for deleted/cancelled events"));
   return { run, queries, notifications };
 }
 
@@ -46,6 +50,30 @@ test("payment reminders render legacy escaped currency placeholders as one amoun
   assert.equal(fixture.notifications.length, 1);
   assert.match(fixture.notifications[0].body, /\$10\.43 is due/);
   assert.doesNotMatch(fixture.notifications[0].body, /\$\\\$|\$\$/);
+});
+
+test("court-booking reminder is sent to Rafeed five days before a scheduled session", async () => {
+  const fixture = pushFixture([event("book-court", { event_date: "2026-10-14" })], {
+    attendees: false,
+    nowMs: Date.parse("2026-10-09T08:30:00Z"),
+  });
+  await fixture.run();
+  const reminder = fixture.notifications.find(item => item.notificationKey === "court-booking-5d:book-court");
+  assert.ok(reminder);
+  assert.deepEqual(reminder.playerIds, ["rafeed-synthetic-id"]);
+  assert.match(reminder.body, /Please book the court/);
+});
+
+test("30-hour court reminder asks Rafeed to confirm or cancel the booking", async () => {
+  const fixture = pushFixture([event("confirm-court", { event_date: "2026-10-14" })], {
+    attendees: false,
+    nowMs: Date.parse("2026-10-13T02:30:00Z"),
+  });
+  await fixture.run();
+  const reminder = fixture.notifications.find(item => item.notificationKey === "court-confirm-30h:confirm-court");
+  assert.ok(reminder);
+  assert.deepEqual(reminder.playerIds, ["rafeed-synthetic-id"]);
+  assert.match(reminder.body, /Confirm the booking, or cancel it/);
 });
 
 test("deleted and cancelled future sessions cannot send EOI or weather alerts", async () => {

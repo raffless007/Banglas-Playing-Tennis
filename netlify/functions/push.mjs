@@ -7,6 +7,10 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:rsiddiquey@gmail.com";
 
 export const PUSH_TYPES = new Set(["payments", "eoi", "session", "matches"]);
+// Rafeed's immutable roster ID (also the default account-linked admin ID).
+// Keeping this recipient server-side prevents clients from choosing who gets
+// activity alerts. It can be overridden per environment without a schema edit.
+export const RAFEED_PLAYER_ID = process.env.RAFEED_PLAYER_ID || "34997eec-ac2e-46c0-8473-816733ef0df5";
 
 export function pushConfigured() {
   return Boolean(SUPABASE_URL && SERVICE_KEY && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);

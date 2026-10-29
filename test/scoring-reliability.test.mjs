@@ -13,7 +13,7 @@ const secret='synthetic-reliability-secret';
 function fixture(){
   let clock=Date.parse('2026-10-21T08:59:59Z');
   class Clock extends Date{constructor(...args){super(...(args.length?args:[clock]));}static now(){return clock;}}
-  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],liveMatches:[],calls:[],gate:null};
+  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],liveMatches:[],calls:[],pushes:[],gate:null};
   const events=[{id:'old',event_date:'2026-10-14',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',account_closed:true,court_fee:54,ball_fee:1,location:'Synthetic court',suburb:'Test',max_players:6},{id:'next',event_date:'2026-10-21',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',location:'Synthetic court',suburb:'Test'}];
   const eois=[participant,other,fourth,owner].map(player_id=>({event_id:'old',player_id,status:'yes',waitlist_position:null}));
   const roster=[owner,participant,other,fourth].map(id=>({id,name:id===owner?'Synthetic owner':'Synthetic participant',active:true}));
@@ -55,10 +55,12 @@ function fixture(){
       if(method==='PATCH'){const row=state.scores.find(row=>row.id===url.searchParams.get('id')?.slice(3));Object.assign(row,body);return json([row]);}
       return json(state.scores.filter(row=>(!url.searchParams.get('id')||row.id===url.searchParams.get('id').slice(3))&&(!url.searchParams.get('live_match_id')||row.live_match_id===url.searchParams.get('live_match_id').slice(3))));
     }
+    if(table==='media_items')return method==='POST'?json([{id:'synthetic-media-id'}]):json([]);
     return method==='GET'?json([]):new Response('');
   };
   const code=source.replace(/^import[\s\S]*?;\n/gm,'').replace(/^export \{[^}]*\};/gm,'').replace('export default async (req, context = {}) =>','return async (req, context = {}) =>');
-  const handler=new Function('deps',`const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process,Date,activePlayerIds,notifyPlayers}=deps;\n${code}`)({...crypto,fetch,Date:Clock,activePlayerIds:async()=>[],notifyPlayers:async()=>({sent:0}),process:{env:{SUPABASE_URL:'https://synthetic.invalid',SUPABASE_SERVICE_ROLE_KEY:'synthetic',ADMIN_SESSION_SECRET:secret}}});
+  const createClient=()=>({storage:{from:()=>({list:async(_folder,{search})=>({data:[{name:search,metadata:{size:1024}}],error:null})})}});
+  const handler=new Function('deps',`const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process,Date,activePlayerIds,notifyPlayers,RAFEED_PLAYER_ID,createClient}=deps;\n${code}`)({...crypto,fetch,Date:Clock,activePlayerIds:async()=>[],notifyPlayers:async payload=>{state.pushes.push(payload);return {sent:0}},RAFEED_PLAYER_ID:owner,createClient,process:{env:{SUPABASE_URL:'https://synthetic.invalid',SUPABASE_SERVICE_ROLE_KEY:'synthetic',ADMIN_SESSION_SECRET:secret}}});
   function token(type,id=participant){const raw=Buffer.from(JSON.stringify({type,sub:type==='player'?id:undefined,sid:type==='player'?'player-session':'admin-session',iat:clock-1000,exp:clock+86400000})).toString('base64url');return `${raw}.${crypto.createHmac('sha256',secret).update(raw).digest('base64url')}`;}
   async function request(action,body={},auth={player:participant},background=true){
     const headers={'content-type':'application/json'};
@@ -113,6 +115,7 @@ test('finishing a live match returns its saved score immediately and retries saf
   const saved=await first.json();assert.equal(first.status,200);assert.equal(saved.score.live_match_id,live.id);assert.equal(saved.score.games_a,4);assert.equal(app.state.liveMatches.length,0);assert.equal(app.state.scores.length,1);
   const retry=await app.request('live-finish',{matchId:live.id,playerId:participant});
   assert.equal(retry.status,200);assert.equal((await retry.json()).score.id,saved.score.id);assert.equal(app.state.scores.length,1);
+  await app.flush();assert.equal(app.state.pushes.length,1);assert.deepEqual(app.state.pushes[0].playerIds,[owner]);assert.equal(app.state.pushes[0].notificationType,'matches');
   assert.match(appSource,/if\(result\.score\)\{data\.scores=\[result\.score/);
   assert.match(appSource,/liveSavedNoticeEventId=result\.score\.event_id;renderScores\(\);void refresh\(\)/);
 });
@@ -129,6 +132,15 @@ test('EOI reads the event attendance only once and persists before audit complet
   assert.equal(app.state.calls.filter(call=>call.table==='eois'&&call.method==='GET').length,1);
   assert.ok(app.eois.some(row=>row.event_id==='next'&&row.player_id===participant));
   for(let i=0;i<10&&!app.state.gate;i++)await Promise.resolve();app.state.auditHeld=false;app.state.gate?.();await app.flush();
+  assert.equal(app.state.pushes.length,1);assert.deepEqual(app.state.pushes[0].playerIds,[owner]);assert.equal(app.state.pushes[0].notificationType,'eoi');
+});
+test('new score submissions queue a Rafeed-only score activity push',async()=>{
+  const app=fixture();assert.equal((await app.request('score',scoreBody())).status,200);await app.flush();
+  assert.equal(app.state.pushes.length,1);assert.deepEqual(app.state.pushes[0].playerIds,[owner]);assert.equal(app.state.pushes[0].notificationType,'matches');assert.match(app.state.pushes[0].title,/New score/);
+});
+test('gallery photo uploads queue a Rafeed-only gallery activity push',async()=>{
+  const app=fixture(),response=await app.request('media-finalize',{playerId:participant,title:'Clubhouse photo',path:'2026/10/aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa.jpg',originalName:'synthetic-photo.jpg',mimeType:'image/jpeg',fileSize:1024,capturedAt:'2026-10-21',consentConfirmed:true});
+  assert.equal(response.status,200);await app.flush();assert.equal(app.state.pushes.length,1);assert.deepEqual(app.state.pushes[0].playerIds,[owner]);assert.equal(app.state.pushes[0].notificationType,'matches');assert.match(app.state.pushes[0].title,/New photo/);
 });
 test('only Rafeed authenticated as the bound immutable player can obtain profile admin',async()=>{
   const app=fixture();

@@ -1,6 +1,8 @@
-import { activePlayerIds, db, notifyPlayers, pushConfigured } from "./push.mjs";
+import { activePlayerIds, db, notifyPlayers, pushConfigured, RAFEED_PLAYER_ID } from "./push.mjs";
 
 const SYDNEY = "Australia/Sydney";
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 function timezoneOffsetMs(date, timeZone) {
   const parts = new Intl.DateTimeFormat("en-AU", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(date);
@@ -123,6 +125,13 @@ export default async () => {
     const pending = allPlayers.filter(playerId => !replied.has(playerId));
     const unpaid = attending.filter(playerId => !payments.some(payment => payment.event_id === event.id && payment.player_id === playerId && payment.paid));
     const label = displayDate(event);
+
+    if (!event.account_closed && startsAt > now && now >= startsAt - 5 * DAY_MS && now < startsAt - 5 * DAY_MS + HOUR_MS) {
+      await notifyPlayers({ playerIds: [RAFEED_PLAYER_ID], notificationType: "session", notificationKey: `court-booking-5d:${event.id}`, eventId: event.id, title: `Book the court · ${label}`, body: `${label} is five days away at ${event.location}, ${event.suburb}. Please book the court: ${eventDetails(event)}.`, url: `/?page=admin&event=${encodeURIComponent(event.id)}`, audience: "selected" });
+    }
+    if (!event.account_closed && startsAt > now && now >= startsAt - 30 * HOUR_MS && now < startsAt - 30 * HOUR_MS + HOUR_MS) {
+      await notifyPlayers({ playerIds: [RAFEED_PLAYER_ID], notificationType: "session", notificationKey: `court-confirm-30h:${event.id}`, eventId: event.id, title: `Confirm the court · ${label}`, body: `${label} starts in about 30 hours at ${event.location}, ${event.suburb}. Confirm the booking, or cancel it if the session is not going ahead.`, url: `/?page=admin&event=${encodeURIComponent(event.id)}`, audience: "selected" });
+    }
 
     if (now >= deadline - 24 * 60 * 60 * 1000 && now < deadline) {
       await notifyPlayers({ playerIds: pending, notificationType: "eoi", notificationKey: `eoi-24h:${event.id}`, eventId: event.id, title: `EOI closes tomorrow · ${label}`, body: `${label} at ${event.location}, ${event.suburb}: reply by ${deadlineLabel(deadline, event.timezone || SYDNEY)} to confirm your spot.`, url: `/?page=play&event=${encodeURIComponent(event.id)}` });
