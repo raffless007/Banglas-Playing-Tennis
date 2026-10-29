@@ -62,8 +62,10 @@ function scheduleText(template, values) {
   return String(template || "")
     .replaceAll("{player}", values.player)
     .replaceAll("{date}", values.date)
-    .replaceAll("${amount}", values.amount)
-    .replaceAll("{amount}", values.amount)
+    // Accept the documented {amount} token, the legacy ${amount} spelling,
+    // and the malformed escaped form found in existing schedule rows
+    // ( $\\${amount} ). The replacement already includes the currency symbol.
+    .replace(/\$\\?\$\{amount\}|\$\{amount\}|\{amount\}/g, values.amount)
     .replaceAll("{payid}", "0420451170")
     .replaceAll("{location}", values.location);
 }

@@ -12,7 +12,7 @@ class TestDate extends Date {
 }
 const event = (id, extra = {}) => ({ id, event_date: "2026-10-07", start_time: "19:30:00", end_time: "22:00:00", timezone: "Australia/Sydney", location: "Synthetic courts", suburb: "Test", court_fee: 54, ball_fee: 1, account_closed: false, cancellation_status: "scheduled", ...extra });
 
-function pushFixture(events, { attendees = true, paidIds = [] } = {}) {
+function pushFixture(events, { attendees = true, paidIds = [], bodyTemplate = "{date}: {amount} at {location}" } = {}) {
   const queries = [], notifications = [];
   const eois = attendees ? events.map(item => ({ event_id: item.id, player_id: "synthetic-player", status: "yes" })) : [];
   const db = async query => {
@@ -20,7 +20,7 @@ function pushFixture(events, { attendees = true, paidIds = [] } = {}) {
     if (query.startsWith("events?")) return events;
     if (query.startsWith("eois?")) return eois;
     if (query.startsWith("payments?")) return paidIds.map(id => ({ event_id: id, player_id: "synthetic-player", paid: true }));
-    if (query.startsWith("push_alert_schedules?")) return [{ code: "test-daily", notification_type: "payments", enabled: true, delay_minutes: 30, repeat_interval_minutes: 1440, title_template: "Payment due · {date}", body_template: "{date}: {amount} at {location}" }];
+    if (query.startsWith("push_alert_schedules?")) return [{ code: "test-daily", notification_type: "payments", enabled: true, delay_minutes: 30, repeat_interval_minutes: 1440, title_template: "Payment due · {date}", body_template: bodyTemplate }];
     throw new Error(`Unexpected synthetic query: ${query}`);
   };
   const source = pushSource.replace(/^import[^\n]*\n/, "").replace("export default async () =>", "return async () =>").replace("export const config", "const config");
@@ -36,6 +36,16 @@ test("push reminders ignore deleted, cancelled, closed and paid events but retai
   assert.deepEqual(fixture.notifications.map(item => item.eventId), ["unpaid"]);
   assert.equal(fixture.notifications[0].notificationType, "payments");
   assert.match(fixture.notifications[0].title, /7 Oct/);
+});
+
+test("payment reminders render legacy escaped currency placeholders as one amount", async () => {
+  const fixture = pushFixture([event("legacy-template", { court_fee: 9.43 })], {
+    bodyTemplate: "{date}: $\\${amount} is due at {location}",
+  });
+  await fixture.run();
+  assert.equal(fixture.notifications.length, 1);
+  assert.match(fixture.notifications[0].body, /\$10\.43 is due/);
+  assert.doesNotMatch(fixture.notifications[0].body, /\$\\\$|\$\$/);
 });
 
 test("deleted and cancelled future sessions cannot send EOI or weather alerts", async () => {

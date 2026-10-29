@@ -13,7 +13,7 @@ const secret='synthetic-reliability-secret';
 function fixture(){
   let clock=Date.parse('2026-10-21T08:59:59Z');
   class Clock extends Date{constructor(...args){super(...(args.length?args:[clock]));}static now(){return clock;}}
-  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],calls:[],gate:null};
+  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],liveMatches:[],calls:[],gate:null};
   const events=[{id:'old',event_date:'2026-10-14',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',account_closed:true,court_fee:54,ball_fee:1,location:'Synthetic court',suburb:'Test',max_players:6},{id:'next',event_date:'2026-10-21',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',location:'Synthetic court',suburb:'Test'}];
   const eois=[participant,other,fourth,owner].map(player_id=>({event_id:'old',player_id,status:'yes',waitlist_position:null}));
   const roster=[owner,participant,other,fourth].map(id=>({id,name:id===owner?'Synthetic owner':'Synthetic participant',active:true}));
@@ -37,6 +37,11 @@ function fixture(){
       if(method==='PATCH'){Object.assign(events.find(row=>row.id===id),body);return new Response('');}
       return json(id?events.filter(row=>row.id===id):events.filter(row=>!row.deleted_at));
     }
+    if(table==='live_matches'){
+      const id=url.searchParams.get('id')?.slice(3);
+      if(method==='DELETE'){state.liveMatches=state.liveMatches.filter(row=>row.id!==id);return new Response('');}
+      return json(id?state.liveMatches.filter(row=>row.id===id):state.liveMatches);
+    }
     if(table==='eois'){
       if(method==='POST'){const at=eois.findIndex(row=>row.event_id===body.event_id&&row.player_id===body.player_id);if(at>=0)eois[at]=body;else eois.push(body);return new Response('');}
       return json(eois.filter(row=>(!url.searchParams.get('event_id')||row.event_id===url.searchParams.get('event_id').slice(3))&&(!url.searchParams.has('status')||row.status==='yes')));
@@ -44,11 +49,11 @@ function fixture(){
     if(table==='match_scores'){
       if(method==='POST'){
         const inserted=[];
-        for(const row of body){if(!state.scores.some(item=>item.id===row.id)){const saved={...row,id:row.id||crypto.randomUUID()};state.scores.push(saved);inserted.push(saved);}}
+        for(const row of Array.isArray(body)?body:[body]){if(!state.scores.some(item=>item.id===row.id||row.live_match_id&&item.live_match_id===row.live_match_id)){const saved={...row,id:row.id||crypto.randomUUID()};state.scores.push(saved);inserted.push(saved);}}
         return json(inserted);
       }
       if(method==='PATCH'){const row=state.scores.find(row=>row.id===url.searchParams.get('id')?.slice(3));Object.assign(row,body);return json([row]);}
-      return json(state.scores.filter(row=>!url.searchParams.get('id')||row.id===url.searchParams.get('id').slice(3)));
+      return json(state.scores.filter(row=>(!url.searchParams.get('id')||row.id===url.searchParams.get('id').slice(3))&&(!url.searchParams.get('live_match_id')||row.live_match_id===url.searchParams.get('live_match_id').slice(3))));
     }
     return method==='GET'?json([]):new Response('');
   };
@@ -99,6 +104,17 @@ test('3–3 needs a valid winning tie-break; Singles race-to-2 remains 2–2',as
   const app=fixture();assert.equal((await app.request('score',scoreBody({matches:[{...match,tiebreakA:4,tiebreakB:3}]}))).status,400);
   const response=await app.request('score',scoreBody({matches:[{...match,matchType:'singles',gamesToWin:2,teamA:[participant],teamB:[owner],gamesA:2,gamesB:2}]}));
   assert.equal(response.status,200);assert.equal(app.state.scores.at(-1).games_a,2);
+});
+test('finishing a live match returns its saved score immediately and retries safely',async()=>{
+  const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,started_at:'2026-10-21T07:00:00.000Z'};
+  app.now('2026-10-21T09:01:00Z');app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));
+  app.state.liveMatches.push(live);
+  const first=await app.request('live-finish',{matchId:live.id,playerId:participant});
+  const saved=await first.json();assert.equal(first.status,200);assert.equal(saved.score.live_match_id,live.id);assert.equal(saved.score.games_a,4);assert.equal(app.state.liveMatches.length,0);assert.equal(app.state.scores.length,1);
+  const retry=await app.request('live-finish',{matchId:live.id,playerId:participant});
+  assert.equal(retry.status,200);assert.equal((await retry.json()).score.id,saved.score.id);assert.equal(app.state.scores.length,1);
+  assert.match(appSource,/if\(result\.score\)\{data\.scores=\[result\.score/);
+  assert.match(appSource,/liveSavedNoticeEventId=result\.score\.event_id;renderScores\(\);void refresh\(\)/);
 });
 test('confirmed writes return while audit work is registered with waitUntil; fallback awaits logging',async()=>{
   const app=fixture();app.state.auditHeld=true;
