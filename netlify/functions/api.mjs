@@ -609,11 +609,40 @@ function invalidateLocationCache() {
   locationCache.expiresAt = 0;
 }
 
-function hydrateEventLocations(events, locations) {
+function locationNameKey(value) {
+  return String(value || "").normalize("NFKD").toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/)
+    .filter(word => !["park", "tennis", "court", "courts"].includes(word)).join(" ");
+}
+
+function resolveEventLocation(event, locations) {
   const byId = new Map((locations || []).map(location => [location.id, location]));
   const byLabel = new Map((locations || []).map(location => [`${String(location.name || '').trim().toLowerCase()}|${String(location.suburb || '').trim().toLowerCase()}`, location]));
+  if (event.location_id && byId.has(event.location_id)) return byId.get(event.location_id);
+  const label = `${String(event.location || '').trim().toLowerCase()}|${String(event.suburb || '').trim().toLowerCase()}`;
+  if (byLabel.has(label)) return byLabel.get(label);
+
+  // Older event rows use short venue labels (for example, “Civic Tennis
+  // Court”) while the catalogue uses the full place name (“Civic Park Tennis
+  // Courts”). Allow a conservative alias match only within the same suburb,
+  // and only when exactly one catalogue location matches.
+  const nameKey = locationNameKey(event.location);
+  const suburbKey = String(event.suburb || "").normalize("NFKD").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  if (!nameKey || !suburbKey) return null;
+  const eventWords = new Set(nameKey.split(" "));
+  const matches = (locations || []).filter(location => {
+    const candidateSuburb = String(location.suburb || "").normalize("NFKD").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const candidateKey = locationNameKey(location.name);
+    if (!candidateKey || candidateSuburb !== suburbKey) return false;
+    const candidateWords = new Set(candidateKey.split(" "));
+    return [...eventWords].every(word => candidateWords.has(word)) || [...candidateWords].every(word => eventWords.has(word));
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function hydrateEventLocations(events, locations) {
   return (events || []).map(event => {
-    const linked = (event.location_id && byId.get(event.location_id)) || byLabel.get(`${String(event.location || '').trim().toLowerCase()}|${String(event.suburb || '').trim().toLowerCase()}`);
+    const linked = resolveEventLocation(event, locations);
     if (!linked) return event;
     const placeUrl = linked.google_maps_url || (linked.google_place_id
       ? `https://www.google.com/maps/search/?api=1&query=Google&query_place_id=${encodeURIComponent(linked.google_place_id)}`
@@ -621,9 +650,10 @@ function hydrateEventLocations(events, locations) {
     return {
       ...event,
       location_id: event.location_id || linked.id,
-      // Null means “use the linked location default”; an empty string remains
-      // an intentional per-event override that hides a PIN.
-      entry_pin: event.entry_pin == null ? (linked.entry_pin || null) : event.entry_pin,
+      // Older admin saves stored an empty string when the PIN field had not
+      // yet been linked. Treat blank as “use the catalogue default”; preserve
+      // a non-empty event-level PIN as an explicit override.
+      entry_pin: String(event.entry_pin || "").trim() ? event.entry_pin : (linked.entry_pin || null),
       address: event.address || linked.address || null,
       google_place_id: event.google_place_id || linked.google_place_id || null,
       google_maps_url: event.google_maps_url || placeUrl,
