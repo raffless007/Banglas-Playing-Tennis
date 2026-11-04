@@ -205,7 +205,10 @@ test("live scoring uses a stacked session picker and a compact, accessible score
   assert.match(runtime, /data-swap-courts=/);
   assert.match(runtime, /aria-label="Swap the teams’ court sides"/);
   assert.match(runtime, /function liveTeamLabel\(ids,serverId\)/);
-  assert.match(runtime, /server-pointer/);
+  assert.match(runtime, /live-player-tile \$\{serving\?'is-serving':''\}/);
+  assert.match(runtime, /aria-label="\$\{serving\?'Serving next':'Not serving'\}"/);
+  assert.match(mobileCss, /\.live-player-tile\.is-serving\{border-color:var\(--lime\);background:#24483e/);
+  assert.match(mobileCss, /\.live-player-tile \.server-pointer\{display:grid/);
   assert.doesNotMatch(runtime.match(/liveMatchCard=function\(m\)\{[\s\S]*?\n    const originalRenderAdminEvents/)?.[0] || "", /Standard doubles serving order:/);
   assert.match(runtime, /Result saved\. Start another match or finish for now\./);
   assert.match(runtime, /liveSavedNoticeEventId=null;const type=\$\('liveMatchType'\)\.value/);
