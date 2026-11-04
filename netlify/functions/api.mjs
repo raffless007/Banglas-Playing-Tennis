@@ -242,7 +242,7 @@ async function manualScoringWindowError(event) {
   return closes && now >= closes ? "Score entry closed when the next session started. Ask an admin to add or correct this result." : "";
 }
 
-function completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) {
+function completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4, tiebreakToWin = 5) {
   // Players often enter the pre-tie-break games (3–3). Store the final
   // 4–3 result once a valid tie-break establishes the winner. Race-to-2
   // Singles deliberately retains its existing 2–2 representation.
@@ -250,7 +250,7 @@ function completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) {
     if (tiebreakA > tiebreakB) gamesA = 4;
     else if (tiebreakB > tiebreakA) gamesB = 4;
   }
-  return { gamesA, gamesB, ...validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin) };
+  return { gamesA, gamesB, ...validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin, tiebreakToWin) };
 }
 
 async function mediaUrl(path) {
@@ -1242,8 +1242,9 @@ async function markPaid(body) {
   return reply({ ok: true, amount });
 }
 
-function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) {
+function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4, tiebreakToWin = 5) {
   const target = Number(gamesToWin) === 2 ? 2 : 4;
+  const tieTarget = Number(tiebreakToWin) === 7 ? 7 : 5;
   if (![gamesA, gamesB].every(value => Number.isInteger(value) && value >= 0 && value <= target + 1)) return { valid: false };
   const regular = target === 2
     ? ((gamesA === 2 && gamesB === 0) || (gamesB === 2 && gamesA === 0) || (gamesA === 3 && gamesB === 1) || (gamesB === 3 && gamesA === 1))
@@ -1256,7 +1257,7 @@ function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4) 
   const aWon = target === 2 ? tiebreakA > tiebreakB : gamesA === 4;
   const winningPoints = aWon ? tiebreakA : tiebreakB;
   const losingPoints = aWon ? tiebreakB : tiebreakA;
-  const valid = losingPoints >= 0 && winningPoints >= 5 && winningPoints - losingPoints >= 2;
+  const valid = losingPoints >= 0 && winningPoints >= tieTarget && winningPoints - losingPoints >= 2;
   return { valid, tiebreakA, tiebreakB };
 }
 
@@ -1276,6 +1277,8 @@ function liveSnapshot(match) {
     server_order: match.server_order || [],
     server_index: Number(match.server_index || 0),
     needs_server_choice: !!match.needs_server_choice,
+    tiebreak_to_win: Number(match.tiebreak_to_win) === 7 ? 7 : 5,
+    needs_tiebreak_choice: !!match.needs_tiebreak_choice,
     games_a: match.games_a,
     games_b: match.games_b,
     point_a: match.point_a,
@@ -1315,15 +1318,17 @@ function liveAdvance(match, winner) {
   const target = Number(next.games_to_win || 4) === 2 ? 2 : 4;
   let gameFinished = false;
   if (next.completed) return next;
+  if (next.needs_tiebreak_choice) return next;
   if (winner === "a") next.points_a++;
   else next.points_b++;
   if (next.is_tiebreak) {
     if (winner === "a") next.tiebreak_a++;
     else next.tiebreak_b++;
-    if (next.tiebreak_a >= 5 && next.tiebreak_a - next.tiebreak_b >= 2) {
+    const tiebreakTarget = Number(next.tiebreak_to_win) === 7 ? 7 : 5;
+    if (next.tiebreak_a >= tiebreakTarget && next.tiebreak_a - next.tiebreak_b >= 2) {
       next.games_a = target === 2 ? 2 : 4; next.completed = true;
     }
-    if (next.tiebreak_b >= 5 && next.tiebreak_b - next.tiebreak_a >= 2) {
+    if (next.tiebreak_b >= tiebreakTarget && next.tiebreak_b - next.tiebreak_a >= 2) {
       next.games_b = target === 2 ? 2 : 4; next.completed = true;
     }
     // Tie-break serving: the natural next server serves one point, then
@@ -1360,7 +1365,10 @@ function liveAdvance(match, winner) {
     next.server_index = server.serverIndex;
     next.server_player_id = server.serverId;
   }
-  if ((target === 2 && next.games_a === 2 && next.games_b === 2) || (target === 4 && next.games_a === 3 && next.games_b === 3)) next.is_tiebreak = true;
+  if ((target === 2 && next.games_a === 2 && next.games_b === 2) || (target === 4 && next.games_a === 3 && next.games_b === 3)) {
+    if (match.match_type === "doubles") next.needs_tiebreak_choice = true;
+    else next.is_tiebreak = true;
+  }
   next.needs_server_choice = false;
   next.game_finished = gameFinished;
   return next;
@@ -1377,6 +1385,7 @@ async function startLiveMatch(body, adminOverride = false) {
   if (active.length) return reply({ error: "Finish or abandon the current live match first." }, 409);
   const matchType = body.matchType === "singles" ? "singles" : "doubles";
   const gamesToWin = matchType === "singles" && Number(body.gamesToWin) === 2 ? 2 : 4;
+  const tiebreakToWin = Number(body.tiebreakToWin) === 7 ? 7 : 5;
   const teamA = Array.isArray(body.teamA) ? body.teamA.filter(Boolean) : [];
   const teamB = Array.isArray(body.teamB) ? body.teamB.filter(Boolean) : [];
   const allPlayers = [...teamA, ...teamB];
@@ -1391,7 +1400,7 @@ async function startLiveMatch(body, adminOverride = false) {
   if (matchType === "doubles" && !teamB.includes(teamBServerId)) return reply({ error: "Choose Team 2’s first server." }, 400);
   const serverOrder = buildServerOrder(teamA, teamB, teamAServerId, teamBServerId);
   let created;
-  const createdPayload = { event_id: body.eventId, match_type: matchType, games_to_win: gamesToWin, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), started_at: new Date().toISOString() };
+  const createdPayload = { event_id: body.eventId, match_type: matchType, games_to_win: gamesToWin, tiebreak_to_win: tiebreakToWin, team_a_player_ids: teamA, team_b_player_ids: teamB, server_player_id: serverOrder[0], server_order: serverOrder, server_index: 0, created_by: body.playerId, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), started_at: new Date().toISOString() };
   try {
     created = await db("live_matches?select=*", {
       method: "POST",
@@ -1408,6 +1417,32 @@ async function startLiveMatch(body, adminOverride = false) {
     }
   }
   return reply({ ok: true, match: created?.[0] || null });
+}
+
+async function chooseLiveTiebreak(body, adminOverride = false) {
+  const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
+  const match = rows?.[0];
+  if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
+  const [event, attending] = await Promise.all([getEvent(match.event_id), attendingSet(match.event_id, body.playerId)]);
+  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
+  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (match.match_type !== "doubles" || Number(match.games_a) !== 3 || Number(match.games_b) !== 3 || !match.needs_tiebreak_choice) {
+    return reply({ error: "The tie-break choice is only available for a doubles match paused at 3–3." }, 409);
+  }
+  const pointsToWin = Number(body.pointsToWin);
+  if (![5, 7].includes(pointsToWin)) return reply({ error: "Choose a 5- or 7-point tie-break." }, 400);
+  const patch = { tiebreak_to_win: pointsToWin, needs_tiebreak_choice: false, is_tiebreak: true, active_scorer_id: body.playerId, scorer_lease_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(), version: Number(match.version || 0) + 1, updated_at: new Date().toISOString() };
+  let updated;
+  try {
+    updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(patch) });
+  } catch (error) {
+    if (!/active_scorer_id|scorer_lease_until|column/i.test(error?.message || "")) throw error;
+    const { active_scorer_id, scorer_lease_until, ...legacyPatch } = patch;
+    updated = await db(`live_matches?id=eq.${encodeURIComponent(match.id)}&completed=eq.false&version=eq.${Number(match.version || 0)}&select=*`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(legacyPatch) });
+  }
+  if (!updated?.length) return reply({ error: "This match changed on another device. Refresh and try again." }, 409);
+  return reply({ ok: true, match: updated[0] });
 }
 
 async function updateLiveServer(body, adminOverride = false) {
@@ -1458,6 +1493,7 @@ async function addLivePoint(body, adminOverride = false) {
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (match.needs_tiebreak_choice) return reply({ error: "Choose a 5- or 7-point tie-break before play continues." }, 409);
   if (!["a", "b"].includes(body.winner)) return reply({ error: "Choose who won the point." }, 400);
   const actionId = String(body.actionId || "").trim();
   const validActionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actionId);
@@ -1489,6 +1525,7 @@ async function addLivePoint(body, adminOverride = false) {
     points_a: next.points_a,
     points_b: next.points_b,
     is_tiebreak: next.is_tiebreak,
+    needs_tiebreak_choice: next.needs_tiebreak_choice,
     completed: next.completed,
     server_index: next.server_index,
     needs_server_choice: next.needs_server_choice,
@@ -1599,6 +1636,7 @@ async function finishLiveMatch(body, adminOverride = false, req = null) {
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
+  if (match.needs_tiebreak_choice) return reply({ error: "Choose the doubles tie-break length before saving." }, 409);
   if (existingSaved?.length) {
     await cleanupLiveMatch(match.id, existingSaved[0].id);
     return reply({ ok: true, alreadySaved: true, score: existingSaved[0] });
@@ -1615,6 +1653,7 @@ async function finishLiveMatch(body, adminOverride = false, req = null) {
         event_id: match.event_id,
         match_type: match.match_type === "singles" ? "singles" : "doubles",
         games_to_win: Number(match.games_to_win) === 2 && match.match_type === "singles" ? 2 : 4,
+        tiebreak_to_win: Number(match.tiebreak_to_win) === 7 ? 7 : 5,
         team_a_player_ids: match.team_a_player_ids,
         team_b_player_ids: match.team_b_player_ids,
         games_a: match.games_a,
@@ -1677,12 +1716,14 @@ async function submitScore(body, adminOverride = false, req = null) {
     const gamesA = Number(match.gamesA), gamesB = Number(match.gamesB);
     const tiebreakA = match.tiebreakA === "" || match.tiebreakA == null ? null : Number(match.tiebreakA);
     const tiebreakB = match.tiebreakB === "" || match.tiebreakB == null ? null : Number(match.tiebreakB);
-    const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
-    if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Singles race-to-2 scores must be 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Every score must be 4–0, 4–1, 4–2, or 4–3 with a valid race-to-5 tie-break won by two points." }, 400);
+    const tiebreakToWin = Number(match.tiebreakToWin) === 7 ? 7 : 5;
+    const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin, tiebreakToWin);
+    if (!checked.valid) return reply({ error: gamesToWin === 2 ? `Singles race-to-2 scores must be 2–0, 3–1, or 2–2 with a valid race-to-${tiebreakToWin} tie-break.` : `Every score must be 4–0, 4–1, 4–2, or 4–3 with a valid race-to-${tiebreakToWin} tie-break won by two points.` }, 400);
     inserts.push({
       event_id: body.eventId,
       match_type: matchType,
       games_to_win: gamesToWin,
+      tiebreak_to_win: tiebreakToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
       games_a: checked.gamesA,
@@ -2316,7 +2357,7 @@ async function adminDeleteScore(body) {
 
 async function adminUpdateScore(body) {
   if (!body.scoreId) return reply({ error: "Score not found." }, 404);
-  const rows = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=id,match_type,games_to_win`);
+  const rows = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=id,match_type,games_to_win,tiebreak_to_win`);
   if (!rows?.length) return reply({ error: "Score not found." }, 404);
   const matchType = body.matchType === "singles" || (body.matchType == null && rows[0].match_type === "singles") ? "singles" : "doubles";
   const gamesToWin = matchType === "singles" && Number(body.gamesToWin ?? rows[0].games_to_win) === 2 ? 2 : 4;
@@ -2333,8 +2374,9 @@ async function adminUpdateScore(body) {
   const gamesA = Number(body.gamesA), gamesB = Number(body.gamesB);
   const tiebreakA = body.tiebreakA === "" || body.tiebreakA == null ? null : Number(body.tiebreakA);
   const tiebreakB = body.tiebreakB === "" || body.tiebreakB == null ? null : Number(body.tiebreakB);
-  const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin);
-  if (!checked.valid) return reply({ error: gamesToWin === 2 ? "Use a Singles race-to-2 score: 2–0, 3–1, or 2–2 with a valid race-to-5 tie-break." : "Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-5 tie-break won by two." }, 400);
+  const tiebreakToWin = Number(body.tiebreakToWin ?? rows[0].tiebreak_to_win) === 7 ? 7 : 5;
+  const checked = completedScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin, tiebreakToWin);
+  if (!checked.valid) return reply({ error: gamesToWin === 2 ? `Use a Singles race-to-2 score: 2–0, 3–1, or 2–2 with a valid race-to-${tiebreakToWin} tie-break.` : `Use a valid set score: 4–0, 4–1, 4–2, or 4–3 with a race-to-${tiebreakToWin} tie-break won by two.` }, 400);
   const pointsA = Math.max(0, Math.trunc(Number(body.pointsA) || 0));
   const pointsB = Math.max(0, Math.trunc(Number(body.pointsB) || 0));
   const updated = await db(`match_scores?id=eq.${encodeURIComponent(body.scoreId)}&select=*`, {
@@ -2343,6 +2385,7 @@ async function adminUpdateScore(body) {
     body: JSON.stringify({
       match_type: matchType,
       games_to_win: gamesToWin,
+      tiebreak_to_win: tiebreakToWin,
       team_a_player_ids: teamA,
       team_b_player_ids: teamB,
       games_a: checked.gamesA,
@@ -2786,7 +2829,7 @@ export default async (req, context = {}) => {
     if (req.method === "GET" && action === "sync-version") return syncVersion();
 
     const adminSessionValid = await isAdminSession(req);
-    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "badge-sync", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
+    const playerActions = ["eoi", "paid", "score", "live-start", "live-server", "live-point", "live-tiebreak", "live-undo", "live-abandon", "live-finish", "event-note", "media-upload-url", "media-finalize", "media-report", "media-delete", "media-favorite", "push-status", "push-subscribe", "push-unsubscribe", "player-update-profile", "player-avatar-upload-url", "notification-read", "notification-read-all", "badge-sync", "passkey-register-options", "passkey-register-verify", "passkey-list", "passkey-rename", "passkey-delete", "player-logout-all"];
     if (playerActions.includes(action)) {
       const playerId = body.playerId || body.submittedBy;
       if (!playerId) return reply({ error: "Choose your player profile first." }, 401);
@@ -2799,6 +2842,7 @@ export default async (req, context = {}) => {
     if (req.method === "POST" && action === "score") return runAudited(req, action, body, () => submitScore(body, adminSessionValid, req));
     if (req.method === "POST" && action === "live-start") return startLiveMatch(body, adminSessionValid);
     if (req.method === "POST" && action === "live-server") return updateLiveServer(body, adminSessionValid);
+    if (req.method === "POST" && action === "live-tiebreak") return chooseLiveTiebreak(body, adminSessionValid);
     if (req.method === "POST" && action === "live-point") return addLivePoint(body, adminSessionValid);
     if (req.method === "POST" && action === "live-undo") return undoLivePoint(body, adminSessionValid);
     if (req.method === "POST" && action === "live-abandon") return abandonLiveMatch(body, adminSessionValid);

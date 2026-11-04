@@ -40,7 +40,9 @@ function fixture(){
     if(table==='live_matches'){
       const id=url.searchParams.get('id')?.slice(3);
       if(method==='DELETE'){state.liveMatches=state.liveMatches.filter(row=>row.id!==id);return new Response('');}
-      return json(id?state.liveMatches.filter(row=>row.id===id):state.liveMatches);
+      if(method==='POST'){const row={...body,id:crypto.randomUUID(),version:0,point_history:[],games_a:0,games_b:0,point_a:0,point_b:0,tiebreak_a:0,tiebreak_b:0,points_a:0,points_b:0,is_tiebreak:false,needs_tiebreak_choice:false,completed:false};state.liveMatches.push(row);return json([row]);}
+      if(method==='PATCH'){const row=state.liveMatches.find(item=>item.id===id);if(!row||url.searchParams.has('version')&&Number(row.version)!==Number(url.searchParams.get('version').slice(3)))return json([]);Object.assign(row,body);return json([row]);}
+      return json((id?state.liveMatches.filter(row=>row.id===id):state.liveMatches).filter(row=>!url.searchParams.has('completed')||row.completed=== (url.searchParams.get('completed')==='eq.true')));
     }
     if(table==='eois'){
       if(method==='POST'){const at=eois.findIndex(row=>row.event_id===body.event_id&&row.player_id===body.player_id);if(at>=0)eois[at]=body;else eois.push(body);return new Response('');}
@@ -106,6 +108,28 @@ test('3–3 needs a valid winning tie-break; Singles race-to-2 remains 2–2',as
   const app=fixture();assert.equal((await app.request('score',scoreBody({matches:[{...match,tiebreakA:4,tiebreakB:3}]}))).status,400);
   const response=await app.request('score',scoreBody({matches:[{...match,matchType:'singles',gamesToWin:2,teamA:[participant],teamB:[owner],gamesA:2,gamesB:2}]}));
   assert.equal(response.status,200);assert.equal(app.state.scores.at(-1).games_a,2);
+});
+test('tie-break scores accept the selected 5- or 7-point target and preserve the selected target',async()=>{
+  const app=fixture();
+  const five=await app.request('score',scoreBody({matches:[{...match,tiebreakA:5,tiebreakB:3,tiebreakToWin:5}]}));assert.equal(five.status,200);assert.equal(app.state.scores[0].tiebreak_to_win,5);
+  const badSeven=await app.request('score',scoreBody({submissionId:'55555555-5555-4555-a555-555555555555',matches:[{...match,tiebreakA:5,tiebreakB:3,tiebreakToWin:7}]}));assert.equal(badSeven.status,400);
+  const seven=await app.request('score',scoreBody({submissionId:'66666666-6666-4666-a666-666666666666',matches:[{...match,tiebreakA:7,tiebreakB:5,tiebreakToWin:7}]}));assert.equal(seven.status,200);assert.equal(app.state.scores[1].tiebreak_to_win,7);
+});
+test('doubles pauses at 3–3 for mandatory 5-or-7 choice before tie-break points',async()=>{
+  const app=fixture();app.now('2026-10-21T09:01:00Z');
+  app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));
+  app.state.liveMatches.push({id:'live-choice',event_id:'next',match_type:'doubles',games_to_win:4,tiebreak_to_win:5,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],server_player_id:participant,server_order:[participant,owner,other,fourth],server_index:0,games_a:2,games_b:3,point_a:3,point_b:0,tiebreak_a:0,tiebreak_b:0,points_a:20,points_b:18,is_tiebreak:false,needs_tiebreak_choice:false,completed:false,version:0,point_history:[],created_by:participant,started_at:'2026-10-21T09:00:00.000Z'});
+  const lastRegularPoint=await app.request('live-point',{matchId:'live-choice',playerId:participant,winner:'a'});assert.equal(lastRegularPoint.status,200,JSON.stringify(await lastRegularPoint.clone().json()));let match=app.state.liveMatches[0];assert.equal(match.games_a,3);assert.equal(match.games_b,3);assert.equal(match.needs_tiebreak_choice,true);assert.equal(match.is_tiebreak,false);
+  const blocked=await app.request('live-point',{matchId:'live-choice',playerId:participant,winner:'a'});assert.equal(blocked.status,409);assert.match((await blocked.json()).error,/Choose a 5- or 7-point/);
+  const confirmed=await app.request('live-tiebreak',{matchId:'live-choice',playerId:participant,pointsToWin:7});assert.equal(confirmed.status,200);match=app.state.liveMatches[0];assert.equal(match.tiebreak_to_win,7);assert.equal(match.needs_tiebreak_choice,false);assert.equal(match.is_tiebreak,true);
+  for(let i=0;i<7;i++){const r=await app.request('live-point',{matchId:'live-choice',playerId:participant,winner:'a'});assert.equal(r.status,200)}
+  match=app.state.liveMatches[0];assert.equal(match.completed,true);assert.equal(match.tiebreak_a,7);
+});
+test('live match setup stores the selected tie-break length',async()=>{
+  const app=fixture();app.now('2026-10-21T09:01:00Z');
+  app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));
+  const response=await app.request('live-start',{eventId:'next',playerId:participant,matchType:'doubles',tiebreakToWin:7,teamA:[participant,other],teamB:[owner,fourth],teamAServerId:participant,teamBServerId:owner});
+  assert.equal(response.status,200);assert.equal(app.state.liveMatches[0].tiebreak_to_win,7);assert.equal(app.state.liveMatches[0].needs_tiebreak_choice,false);
 });
 test('finishing a live match returns its saved score immediately and retries safely',async()=>{
   const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,started_at:'2026-10-21T07:00:00.000Z'};

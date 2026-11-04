@@ -11,6 +11,7 @@ const schema = await readFile(new URL("../supabase/schema.sql", import.meta.url)
 const badgePresets = await readFile(new URL("../supabase/migrations/045_badge_rule_presets.sql", import.meta.url), "utf8");
 const freshLegsMigration = await readFile(new URL("../supabase/migrations/047_fresh_legs_max_matches.sql", import.meta.url), "utf8");
 const badgeRangesMigration = await readFile(new URL("../supabase/migrations/048_badge_criteria_ranges.sql", import.meta.url), "utf8");
+const tiebreakMigration = await readFile(new URL("../supabase/migrations/050_match_tiebreak_choices.sql", import.meta.url), "utf8");
 const mobile = await readFile(new URL("../public/js/mobile-first.js", import.meta.url), "utf8");
 const mobileCss = await readFile(new URL("../public/css/mobile-first.css", import.meta.url), "utf8");
 const reliabilityClient = await readFile(new URL("../public/js/scoring-reliability.js", import.meta.url), "utf8");
@@ -212,4 +213,33 @@ test("live scoring uses a stacked session picker and a compact, accessible score
   assert.doesNotMatch(runtime.match(/liveMatchCard=function\(m\)\{[\s\S]*?\n    const originalRenderAdminEvents/)?.[0] || "", /Standard doubles serving order:/);
   assert.match(runtime, /Result saved\. Start another match or finish for now\./);
   assert.match(runtime, /liveSavedNoticeEventId=null;const type=\$\('liveMatchType'\)\.value/);
+});
+
+test("live matches persist a 5-or-7 tie-break and doubles must confirm at 3–3", () => {
+  assert.match(runtime, /TIE-BREAK LENGTH/);
+  assert.match(runtime, /Tie-break at 3–3/);
+  assert.match(runtime, /live-tiebreak/);
+  assert.match(api, /match\.needs_tiebreak_choice\) return reply\(\{ error: "Choose a 5- or 7-point tie-break before play continues\./);
+  assert.match(api, /tiebreak_a >= tiebreakTarget/);
+  assert.match(schema, /tiebreak_to_win integer not null default 5 check \(tiebreak_to_win in \(5,7\)\)/);
+  assert.match(schema, /needs_tiebreak_choice boolean not null default false/);
+  assert.match(tiebreakMigration, /add column if not exists needs_tiebreak_choice/);
+});
+
+test("live player tiles use concise disambiguated names and equal dimensions", () => {
+  assert.match(runtime, /function livePlayerDisplayName\(id\)/);
+  assert.match(runtime, /duplicates\.length<2\)return first/);
+  assert.match(runtime, /\$\{first\} \$\{Array\.from\(last\)\[0\]\.toLocaleUpperCase\(\)\}\./);
+  assert.match(runtime, /live-player-name">\$\{esc\(livePlayerDisplayName\(id\)\)\}/);
+  assert.match(mobileCss, /\.live-player-tile\{[^}]*width:100%;height:40px;[^}]*box-sizing:border-box/);
+  assert.match(mobileCss, /\.live-player-name\{[^}]*white-space:nowrap/);
+});
+
+test("mobile bottom navigation stays in the app shell instead of a drifting fixed footer", () => {
+  assert.match(mobileCss, /body\{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden\}/);
+  assert.match(mobileCss, /main\{flex:1 1 auto;min-height:0;overflow-x:clip;overflow-y:auto/);
+  assert.match(mobileCss, /\.mobile\{position:relative;inset:auto;flex:0 0 auto/);
+  assert.doesNotMatch(mobileCss.match(/\.mobile\{[^}]*\}/)?.[0]||"", /position:fixed/);
+  assert.match(runtime, /scroller\.scrollTop=0;scrollTo\(0,0\)/);
+  assert.match(runtime, /document\.querySelector\('main'\)\?\.scrollTop\|\|window\.scrollY/);
 });
