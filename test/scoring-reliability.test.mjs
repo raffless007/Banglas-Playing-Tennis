@@ -125,11 +125,11 @@ test('doubles pauses at 3–3 for mandatory 5-or-7 choice before tie-break point
   for(let i=0;i<7;i++){const r=await app.request('live-point',{matchId:'live-choice',playerId:participant,winner:'a'});assert.equal(r.status,200)}
   match=app.state.liveMatches[0];assert.equal(match.completed,true);assert.equal(match.tiebreak_a,7);
 });
-test('live match setup stores the selected tie-break length',async()=>{
+test('live match setup uses a provisional default until the doubles 3–3 choice',async()=>{
   const app=fixture();app.now('2026-10-21T09:01:00Z');
   app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));
-  const response=await app.request('live-start',{eventId:'next',playerId:participant,matchType:'doubles',tiebreakToWin:7,teamA:[participant,other],teamB:[owner,fourth],teamAServerId:participant,teamBServerId:owner});
-  assert.equal(response.status,200);assert.equal(app.state.liveMatches[0].tiebreak_to_win,7);assert.equal(app.state.liveMatches[0].needs_tiebreak_choice,false);
+  const response=await app.request('live-start',{eventId:'next',playerId:participant,matchType:'doubles',teamA:[participant,other],teamB:[owner,fourth],teamAServerId:participant,teamBServerId:owner});
+  assert.equal(response.status,200);assert.equal(app.state.liveMatches[0].tiebreak_to_win,5);assert.equal(app.state.liveMatches[0].needs_tiebreak_choice,false);
 });
 test('finishing a live match returns its saved score immediately and retries safely',async()=>{
   const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,started_at:'2026-10-21T07:00:00.000Z'};

@@ -215,9 +215,13 @@ test("live scoring uses a stacked session picker and a compact, accessible score
   assert.match(runtime, /liveSavedNoticeEventId=null;const type=\$\('liveMatchType'\)\.value/);
 });
 
-test("live matches persist a 5-or-7 tie-break and doubles must confirm at 3–3", () => {
-  assert.match(runtime, /TIE-BREAK LENGTH/);
+test("live doubles choose tie-break length only at 3–3", () => {
+  assert.doesNotMatch(runtime, /tieLabel\('liveTiebreakToWin'/);
+  assert.doesNotMatch(runtime, /tiebreakToWin:\$\('liveTiebreakToWin'\)/);
   assert.match(runtime, /Tie-break at 3–3/);
+  assert.match(runtime, /Choose 5 or 7 points/);
+  assert.match(runtime, /confirmLiveTiebreak" class="primary" disabled/);
+  assert.match(runtime, /button\.disabled=!event\.target\.value/);
   assert.match(runtime, /live-tiebreak/);
   assert.match(api, /match\.needs_tiebreak_choice\) return reply\(\{ error: "Choose a 5- or 7-point tie-break before play continues\./);
   assert.match(api, /tiebreak_a >= tiebreakTarget/);
