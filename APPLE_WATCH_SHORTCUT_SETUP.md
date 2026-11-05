@@ -1,6 +1,6 @@
 # Tennis Scorer: Apple Watch Shortcut
 
-**Development candidate only:** this API is not live yet. Do not create a production key or use these instructions for a real match until the release has been approved and deployed. The shortcut has not been tested on a physical iPhone or Apple Watch. Apple notes that not all iPhone shortcuts work on Watch; test your exact iOS/watchOS versions and network before relying on it.
+Use these instructions once **Apple Watch Scoring** appears under your profile's **Login & Security** settings. The shortcut has not yet been tested on a physical iPhone or Apple Watch. Apple notes that not all iPhone shortcuts work on Watch; test your exact iOS/watchOS versions and network before relying on it during a real match.
 
 ## Keep your key private
 
