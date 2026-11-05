@@ -17,6 +17,7 @@
         }
         const error = new Error(json?.error || 'The server response could not be confirmed.');
         error.status = response.status;
+        error.conflict = json?.conflict === true;
         error.uncertain = method !== 'GET' && (!json || response.status >= 500);
         throw error;
       }

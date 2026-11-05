@@ -1,4 +1,5 @@
 import {
+  createHash,
   createHmac,
   pbkdf2Sync,
   randomBytes,
@@ -13,6 +14,7 @@ import {
   verifyRegistrationResponse,
 } from "@simplewebauthn/server";
 import { activePlayerIds, notifyPlayers, pushConfigured, RAFEED_PLAYER_ID } from "./push.mjs";
+import "../../public/js/score-format.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -488,10 +490,10 @@ async function isAdminSession(req) {
   return validateOnce(req, "admin", () => validateAdminSession(req));
 }
 
-async function validateAdminSession(req) {
+async function validateAdminSession(req, touch = true) {
   const payload = adminTokenPayload(req);
   if (!payload) return false;
-  if (payload.sub && (!ADMIN_PLAYER_IDS.has(payload.sub) || !(await isPlayer(req, payload.sub)))) return false;
+  if (payload.sub && (!ADMIN_PLAYER_IDS.has(payload.sub) || !(await (touch ? isPlayer(req, payload.sub) : validatePlayerSession(req, payload.sub, false))))) return false;
   // Legacy tokens have no server-side session id and remain valid until their
   // signed expiry. New tokens are tracked when the table is available.
   if (!payload.sid) return true;
@@ -504,7 +506,7 @@ async function validateAdminSession(req) {
       await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
       return false;
     }
-    await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
+    if (touch) await db(`admin_sessions?session_id=eq.${encodeURIComponent(payload.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
     return true;
   } catch {
     // Migration 036 is additive. Keep the signed token usable if an older
@@ -531,7 +533,7 @@ async function isPlayer(req, playerId) {
   return validateOnce(req, `player:${playerId}`, () => validatePlayerSession(req, playerId));
 }
 
-async function validatePlayerSession(req, playerId) {
+async function validatePlayerSession(req, playerId, touch = true) {
   const token = req.headers.get("x-player-session") || "";
   const [payload, signature] = token.split(".");
   if (!payload || !signature) return false;
@@ -554,7 +556,7 @@ async function validatePlayerSession(req, playerId) {
         await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) }).catch(() => {});
         return false;
       }
-      await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
+      if (touch) await db(`player_sessions?session_id=eq.${encodeURIComponent(session.sid)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ last_seen_at: new Date().toISOString() }) }).catch(() => {});
     }
     return true;
   } catch { return false; }
@@ -572,6 +574,11 @@ async function revokePlayerSessions(body) {
 
 async function getEvent(eventId) {
   const rows = await db(`events?id=eq.${encodeURIComponent(eventId)}&select=*`);
+  return rows?.[0];
+}
+
+async function getScoringEvent(eventId) {
+  const rows = await db(`events?id=eq.${encodeURIComponent(eventId)}&select=id,event_date,start_time,end_time,court_2_enabled,court_2_start_time,court_2_end_time`);
   return rows?.[0];
 }
 
@@ -732,8 +739,7 @@ async function appState(req, timings = []) {
     guest_event_id: player.guest_event_id,
     guest_of_player_id: player.guest_of_player_id,
     pin_configured: Boolean(player.pin_hash),
-    email: player.email || "",
-    mobile: player.mobile || "",
+    ...(authenticated ? { email: player.email || "", mobile: player.mobile || "" } : {}),
     avatar_url: avatars.get(player.id) || null,
     ...(admin || player.id === playerId ? { address: player.address || "" } : {}),
   }));
@@ -793,6 +799,13 @@ async function liveState() {
 async function eoiState() {
   const eois = await db("eois?select=event_id,player_id,status,updated_at,waitlist_position,attendance_status,checked_in_at");
   return reply({ eois, serverNow: new Date().toISOString() });
+}
+
+async function canReadLiveData(req) {
+  const playerId = playerSessionSubject(req);
+  // Polling must not extend idle sessions or write a last-seen row every 2s.
+  const [admin, player] = await Promise.all([validateAdminSession(req, false), playerId ? validatePlayerSession(req, playerId, false) : false]);
+  return admin || player;
 }
 
 async function adminState() {
@@ -1263,8 +1276,9 @@ function validTennisScore(gamesA, gamesB, tiebreakA, tiebreakB, gamesToWin = 4, 
 
 export { validTennisScore };
 
-async function attendingSet(eventId, playerId) {
-  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(eventId)}&status=eq.yes&waitlist_position=is.null&select=player_id`);
+async function attendingSet(eventId, playerId, onlyPlayer = false) {
+  const playerFilter = onlyPlayer && playerId ? `&player_id=eq.${encodeURIComponent(playerId)}` : '';
+  const attendingRows = await db(`eois?event_id=eq.${encodeURIComponent(eventId)}&status=eq.yes&waitlist_position=is.null${playerFilter}&select=player_id`);
   const attending = new Set(attendingRows.map(row => row.player_id));
   if (playerId && !attending.has(playerId)) return null;
   return attending;
@@ -1423,10 +1437,11 @@ async function chooseLiveTiebreak(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
-  const [event, attending] = await Promise.all([getEvent(match.event_id), attendingSet(match.event_id, body.playerId)]);
+  const [event, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (body.expectedVersion !== undefined && body.expectedVersion !== Number(match.version || 0)) return reply({ error: "This match changed on another device. Refresh and try again.", conflict: true }, 409);
   if (match.match_type !== "doubles" || Number(match.games_a) !== 3 || Number(match.games_b) !== 3 || !match.needs_tiebreak_choice) {
     return reply({ error: "The tie-break choice is only available for a doubles match paused at 3–3." }, 409);
   }
@@ -1489,7 +1504,7 @@ async function addLivePoint(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&completed=eq.false&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
-  const [event, attending] = await Promise.all([getEvent(match.event_id), attendingSet(match.event_id, body.playerId)]);
+  const [event, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
@@ -1499,18 +1514,21 @@ async function addLivePoint(body, adminOverride = false) {
   const validActionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actionId);
   if (validActionId) {
     try {
-      const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&live_match_id=eq.${encodeURIComponent(match.id)}&select=result`);
+      const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&live_match_id=eq.${encodeURIComponent(match.id)}&select=winner,result`);
+      if (prior?.[0] && prior[0].winner !== body.winner) return reply({ error: "This action ID was already used for another point." }, 409);
       if (prior?.[0]?.result) return reply(prior[0].result);
+      if (body.expectedVersion !== undefined && body.expectedVersion !== Number(match.version || 0)) return reply({ error: "This score changed on another device. Refresh and try again.", conflict: true }, 409);
       await db("live_point_actions", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ action_id: actionId, live_match_id: match.id, winner: body.winner, status: "pending" }) });
     } catch (error) {
       if (/duplicate|unique/i.test(error?.message || "")) {
-        const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&select=result`);
-        if (prior?.[0]?.result) return reply(prior[0].result);
+        const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(actionId)}&live_match_id=eq.${encodeURIComponent(match.id)}&select=winner,result`);
+        if (prior?.[0]?.winner === body.winner && prior[0].result) return reply(prior[0].result);
         return reply({ error: "This point is already being synced. Refresh the match." }, 409);
       }
-      if (!/live_point_actions|relation|column/i.test(error?.message || "")) throw error;
+      if (body.expectedVersion !== undefined || !/live_point_actions|relation|column/i.test(error?.message || "")) throw error;
     }
   }
+  if (!validActionId && body.expectedVersion !== undefined && body.expectedVersion !== Number(match.version || 0)) return reply({ error: "This score changed on another device. Refresh and try again.", conflict: true }, 409);
   const next = liveAdvance(match, body.winner);
   const history = [...liveHistory(match), liveSnapshot(match)].slice(-200);
   const gameFinished = !!next.game_finished;
@@ -1556,11 +1574,12 @@ async function undoLivePoint(body, adminOverride = false) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
-  const event = await getEvent(match.event_id);
+  const event = await getScoringEvent(match.event_id);
   const windowError = event ? scoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
-  const attending = await attendingSet(match.event_id, body.playerId);
+  const attending = await attendingSet(match.event_id, body.playerId, true);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
+  if (body.expectedVersion !== undefined && body.expectedVersion !== Number(match.version || 0)) return reply({ error: "This match changed on another device. Refresh and try again.", conflict: true }, 409);
   const history = liveHistory(match);
   const previous = history.at(-1);
   if (!previous) return reply({ error: "There is no point to undo." }, 409);
@@ -1596,89 +1615,33 @@ async function abandonLiveMatch(body, adminOverride = false) {
   return reply({ ok: true, matchId: match.id });
 }
 
-async function cleanupLiveMatch(matchId, scoreId = null) {
-  try {
-    await db(`live_matches?id=eq.${encodeURIComponent(matchId)}`, {
-      method: "DELETE",
-      headers: { Prefer: "return=minimal" },
-    });
-  } catch (error) {
-    // Older databases may still have the original NO ACTION foreign key.
-    // Detach the saved score, then retry cleanup so a completed match cannot
-    // block the next match in the same event.
-    if (!scoreId) throw error;
-    await db(`match_scores?id=eq.${encodeURIComponent(scoreId)}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ live_match_id: null, updated_at: new Date().toISOString() }),
-    });
-    await db(`live_matches?id=eq.${encodeURIComponent(matchId)}`, {
-      method: "DELETE",
-      headers: { Prefer: "return=minimal" },
-    });
+async function finishLiveMatch(body, adminOverride = false, req = null, trustedWatch = false) {
+  if (!body.playerId || !body.matchId || !Number.isSafeInteger(body.expectedVersion) || body.expectedVersion < 0) {
+    return reply({ error: "Match and displayed version are required. Refresh and try again." }, 400);
   }
-}
-
-async function finishLiveMatch(body, adminOverride = false, req = null) {
   const rows = await db(`live_matches?id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
   const match = rows?.[0];
-  if (!match || !body.playerId) {
-    const alreadySaved = await db(`match_scores?live_match_id=eq.${encodeURIComponent(body.matchId || "")}&select=*`);
-    if (alreadySaved?.length) return reply({ ok: true, alreadySaved: true, score: alreadySaved[0] });
-    return reply({ error: "Live match not found." }, 404);
+  let event = null;
+  if (match) {
+    const [foundEvent, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
+    event = foundEvent;
+    const windowError = event ? scoringWindowError(event) : "Event not found.";
+    if (windowError && !adminOverride) return reply({ error: windowError }, 403);
+    if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   }
-  const [event, attending, existingSaved] = await Promise.all([
-    getEvent(match.event_id),
-    attendingSet(match.event_id, body.playerId),
-    db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=*`),
-  ]);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
-  if (windowError && !adminOverride) return reply({ error: windowError }, 403);
-  if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
-  if (!match.completed) return reply({ error: "The live set is not finished yet." }, 409);
-  if (match.needs_tiebreak_choice) return reply({ error: "Choose the doubles tie-break length before saving." }, 409);
-  if (existingSaved?.length) {
-    await cleanupLiveMatch(match.id, existingSaved[0].id);
-    return reply({ ok: true, alreadySaved: true, score: existingSaved[0] });
-  }
-  const endedAt = new Date().toISOString();
-  const durationSeconds = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(match.started_at || match.created_at).getTime()) / 1000));
-  let savedRows = null;
-  let insertedScore = false;
-  try {
-    savedRows = await db("match_scores", {
-      method: "POST",
-      headers: { Prefer: "return=representation" },
-      body: JSON.stringify({
-        event_id: match.event_id,
-        match_type: match.match_type === "singles" ? "singles" : "doubles",
-        games_to_win: Number(match.games_to_win) === 2 && match.match_type === "singles" ? 2 : 4,
-        tiebreak_to_win: Number(match.tiebreak_to_win) === 7 ? 7 : 5,
-        team_a_player_ids: match.team_a_player_ids,
-        team_b_player_ids: match.team_b_player_ids,
-        games_a: match.games_a,
-        games_b: match.games_b,
-        tiebreak_a: match.is_tiebreak ? match.tiebreak_a : null,
-        tiebreak_b: match.is_tiebreak ? match.tiebreak_b : null,
-        points_a: match.points_a,
-        points_b: match.points_b,
-        submitted_by: body.playerId,
-        live_match_id: match.id,
-        started_at: match.started_at || match.created_at,
-        ended_at: endedAt,
-        duration_seconds: durationSeconds,
-      }),
-    });
-    insertedScore = Boolean(savedRows?.length);
-  } catch (error) {
-    if (!/duplicate|unique/i.test(error?.message || "")) throw error;
-    savedRows = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=*`);
-  }
-  if (!savedRows?.[0]) savedRows = await db(`match_scores?live_match_id=eq.${encodeURIComponent(match.id)}&select=*`);
-  const score = savedRows?.[0] || null;
-  const scoreId = score?.id || null;
-  await cleanupLiveMatch(match.id, scoreId);
-  if (insertedScore && score && req) {
+  // The caller mode is selected only from the server-verified admin session;
+  // no browser-supplied mode or override flag is accepted.
+  const result = await db("rpc/finalize_live_match_atomic", {
+    method: "POST",
+    body: JSON.stringify({ p_match_id: body.matchId, p_expected_version: body.expectedVersion, p_submitted_by: body.playerId, p_caller_mode: adminOverride ? "admin" : trustedWatch ? "watch" : "player" }),
+  });
+  if (result?.status === "conflict") return reply({ error: "This match changed on another device. Score refreshed. Review it before saving again.", conflict: true }, 409);
+  if (result?.status === "forbidden") return reply({ error: "You are not authorized to save this match." }, 403);
+  if (result?.status === "unfinished") return reply({ error: "The live set is not finished or needs a tie-break choice." }, 409);
+  if (result?.status === "not_found") return reply({ error: "Live match not found." }, 404);
+  if (!['saved', 'already_saved'].includes(result?.status) || !result.score) return reply({ error: "The result could not be saved." }, 500);
+  const score = result.score;
+  if (result.status === "saved" && req && event) {
     await notifyRafeed(req, {
       notificationType: "matches", notificationKey: `score-activity:live:${score.id}`,
       title: `New score · ${eventLabel(event)}`,
@@ -1686,7 +1649,7 @@ async function finishLiveMatch(body, adminOverride = false, req = null) {
       url: `/?page=scores&event=${encodeURIComponent(event.id)}`, eventId: event.id,
     });
   }
-  return reply({ ok: true, alreadySaved: !scoreId, score });
+  return reply({ ok: true, alreadySaved: result.status === "already_saved", score });
 }
 
 async function submitScore(body, adminOverride = false, req = null) {
@@ -2790,6 +2753,137 @@ async function runAudited(req, action, body, operation) {
   return result;
 }
 
+const watchTokenBuckets = new Map();
+function allowWatchToken(hash) {
+  const now = Date.now();
+  if (!watchTokenBuckets.has(hash) && watchTokenBuckets.size >= 5000) {
+    for (const [key, times] of watchTokenBuckets) if (!times.some(t => now - t < 60_000)) watchTokenBuckets.delete(key);
+    if (watchTokenBuckets.size >= 5000) return false;
+  }
+  const recent = (watchTokenBuckets.get(hash) || []).filter(t => now - t < 60_000);
+  if (recent.length >= 240) return false;
+  recent.push(now); watchTokenBuckets.set(hash, recent);
+  if (watchTokenBuckets.size > 5000) for (const [key, times] of watchTokenBuckets) if (!times.some(t => now - t < 60_000)) watchTokenBuckets.delete(key);
+  return true;
+}
+const watchUuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+const inWatchMatch = (m, playerId) => [...(m.team_a_player_ids || []), ...(m.team_b_player_ids || [])].includes(playerId);
+async function watchMatchById(id) {
+  return (await db(`live_matches?id=eq.${encodeURIComponent(id)}&select=*&limit=1`))?.[0] || null;
+}
+async function watchMatches(playerId) {
+  const array = encodeURIComponent(`{${playerId}}`);
+  const [a,b] = await Promise.all([
+    db(`live_matches?team_a_player_ids=cs.${array}&select=*&limit=2`),
+    db(`live_matches?team_b_player_ids=cs.${array}&select=*&limit=2`),
+  ]);
+  return [...new Map([...(a || []), ...(b || [])].map(match => [match.id, match])).values()];
+}
+async function watchAttending(match, playerId) {
+  const rows = await db(`eois?event_id=eq.${encodeURIComponent(match.event_id)}&player_id=eq.${encodeURIComponent(playerId)}&status=eq.yes&waitlist_position=is.null&select=player_id&limit=1`);
+  return !!rows?.length;
+}
+async function watchCompact(match, extra = {}) {
+  const ids = [...new Set([...(match.team_a_player_ids || []), ...(match.team_b_player_ids || []), match.server_player_id].filter(Boolean))];
+  const rows = ids.length ? await db(`players?id=in.(${ids.map(encodeURIComponent).join(',')})&select=id,name`) : [];
+  const names = new Map((rows || []).map(player => [player.id, player.name]));
+  const name = id => names.get(id) || 'Player';
+  const teamA = (match.team_a_player_ids || []).map(name).join(' / '), teamB = (match.team_b_player_ids || []).map(name).join(' / ');
+  const [a,b] = globalThis.BPTScoreFormat.parts(match);
+  const requiresPhoneAction = !!match.needs_server_choice;
+  return { ok:true, active:true, matchId:match.id, version:Number(match.version || 0), teamA, teamB,
+    displayTitle:`${teamA} vs ${teamB}`, pointScoreA:a, pointScoreB:b, scoreLine:`${a} – ${b}`,
+    gamesA:match.games_a, gamesB:match.games_b, gamesLine:`Games ${match.games_a} – ${match.games_b}`,
+    serverLine:`Serving: ${name(match.server_player_id)}`, completed:!!match.completed,
+    canUndo:Array.isArray(match.point_history) && match.point_history.length > 0,
+    canFinish:!!match.completed && !match.needs_tiebreak_choice && !requiresPhoneAction,
+    needsTiebreakChoice:!!match.needs_tiebreak_choice, tiebreakToWin:Number(match.tiebreak_to_win || 5),
+    requiresPhoneAction, nextActionId:randomUUID(), conflict:false,
+    message:requiresPhoneAction ? 'Choose the next server on your phone before continuing.' : '', ...extra };
+}
+async function watchScore(req, body) {
+  try {
+    const token = req.headers.get('x-watch-token') || '';
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return reply({ ok:false, error:'Watch access invalid. Generate a new key from your profile.' }, 401, { 'Cache-Control':'no-store' });
+    const hash = createHash('sha256').update(token).digest('hex');
+    if (!consumeRateLimit(req, 'watch-score-ip', 1000) || !allowWatchToken(hash)) return reply({ ok:false, error:'Too many requests. Please wait.' }, 429, { 'Cache-Control':'no-store' });
+    const keys = await db(`watch_scoring_tokens?token_hash=eq.${hash}&select=id,player_id,revoked_at,expires_at,last_used_at&limit=1`), key = keys?.[0];
+    const expiry = key?.expires_at ? Date.parse(key.expires_at) : null;
+    if (!key || key.revoked_at || (expiry !== null && (!Number.isFinite(expiry) || expiry <= Date.now()))) return reply({ ok:false, error:'Watch access expired or revoked. Generate a new key from your profile.' }, 401, { 'Cache-Control':'no-store' });
+    const playerId = key.player_id;
+    const active = await db(`players?id=eq.${encodeURIComponent(playerId)}&active=eq.true&select=id&limit=1`);
+    if (!active?.length) return reply({ ok:false, error:'Player access is inactive.' }, 403, { 'Cache-Control':'no-store' });
+    if (!key.last_used_at || Date.now() - Date.parse(key.last_used_at) >= 300_000) {
+      await afterResponse(req, () => db(`watch_scoring_tokens?id=eq.${encodeURIComponent(key.id)}&revoked_at=is.null`, { method:'PATCH', headers:{Prefer:'return=minimal'}, body:JSON.stringify({last_used_at:new Date().toISOString()}) }));
+    }
+    const operation = body.operation;
+    if (!['state','team_a_plus','team_b_plus','undo','tiebreak_5','tiebreak_7','finish'].includes(operation)) return reply({ ok:false, error:'Unsupported Watch action.' }, 400);
+    if (['playerId','callerMode','adminOverride'].some(field => Object.prototype.hasOwnProperty.call(body,field))) return reply({ ok:false, error:'Unexpected identity field.' }, 400);
+    if (operation === 'state') {
+      const matches = await watchMatches(playerId);
+      if (!matches.length) return reply({ ok:true, active:false, message:'No live match found. Start one on your phone.' }, 200, {'Cache-Control':'no-store'});
+      if (matches.length > 1) return reply({ ok:false, active:false, multipleMatches:true, message:'Multiple live matches were found. Resolve them on your phone first.' }, 200, {'Cache-Control':'no-store'});
+      if (!(await watchAttending(matches[0],playerId))) return reply({ ok:false, error:'You are not marked In for this session.' }, 403);
+      return reply(await watchCompact(matches[0]), 200, {'Cache-Control':'no-store'});
+    }
+    if (!watchUuid(body.matchId) || !Number.isSafeInteger(body.expectedVersion) || body.expectedVersion < 0) return reply({ ok:false, error:'Refresh the match and try again.' }, 400);
+    if (operation.startsWith('team_') && !watchUuid(body.actionId)) return reply({ ok:false, error:'Refresh before adding a point.' }, 400);
+    let match = await watchMatchById(body.matchId);
+    if (!match && operation === 'finish') {
+      const result = await finishLiveMatch({matchId:body.matchId,playerId,expectedVersion:body.expectedVersion},false,req,true);
+      if (result.ok) return reply({ ok:true, active:false, completed:true, message:'Match saved.' }, 200, {'Cache-Control':'no-store'});
+      const payload = await result.json(); return reply({ok:false,error:payload.error || 'Unable to save match.'},result.status);
+    }
+    if (!match || !inWatchMatch(match,playerId) || !(await watchAttending(match,playerId))) return reply({ ok:false, error:'You cannot control this match.' }, 403);
+    const winner = operation === 'team_a_plus' ? 'a' : operation === 'team_b_plus' ? 'b' : null;
+    if (winner) {
+      const prior = await db(`live_point_actions?action_id=eq.${encodeURIComponent(body.actionId)}&select=live_match_id,winner,status,result&limit=1`);
+      if (prior?.length) {
+        if (prior[0].live_match_id !== match.id || prior[0].winner !== winner) return reply(await watchCompact(match,{ok:false,message:'Action already used. Refresh before scoring.'}));
+        if (prior[0].result) return reply(await watchCompact(match,{message:'Point already recorded.'}));
+        return reply(await watchCompact(match,{ok:false,message:'Point is still syncing. Refresh before scoring.'}));
+      }
+    }
+    if (Number(match.version || 0) !== body.expectedVersion) return reply(await watchCompact(match,{ok:false,conflict:true,message:'Score changed on another device. Refreshed.'}));
+    if (match.needs_server_choice) return reply(await watchCompact(match,{ok:false,message:'Choose the next server on your phone before continuing.'}));
+    let result;
+    const input = { matchId:match.id, playerId, expectedVersion:body.expectedVersion };
+    if (winner) result = await addLivePoint({...input,winner,actionId:body.actionId});
+    else if (operation === 'undo') result = await undoLivePoint(input);
+    else if (operation.startsWith('tiebreak_')) result = await chooseLiveTiebreak({...input,pointsToWin:operation === 'tiebreak_5' ? 5 : 7});
+    else result = await finishLiveMatch(input,false,req,true);
+    const payload = await result.json();
+    if (operation === 'finish' && result.ok) return reply({ok:true,active:false,completed:true,message:'Match saved.'},200,{'Cache-Control':'no-store'});
+    match = await watchMatchById(body.matchId);
+    if (!match || !inWatchMatch(match,playerId)) return reply({ok:false,active:false,message:'Match changed. Refresh on your phone.'});
+    if (!result.ok) {
+      const conflict = !!payload.conflict || /changed on another device/i.test(payload.error || '');
+      return reply(await watchCompact(match,{ok:false,conflict,message:conflict?'Score changed on another device. Refreshed.':(payload.error || 'Action not completed.')}));
+    }
+    return reply(await watchCompact(match,{message:operation==='undo'?'Point undone.':winner?'Point saved.':'Tie-break selected.'}),200,{'Cache-Control':'no-store'});
+  } catch {
+    return reply({ok:false,error:'Connection or server error. Score not confirmed.'},503,{'Cache-Control':'no-store'});
+  }
+}
+
+async function manageWatchKey(req, operation) {
+  const playerId = playerSessionSubject(req);
+  if (!playerId || !(await isPlayer(req, playerId))) return reply({ error: 'Please sign in to manage Watch access.' }, 401);
+  const filter = `watch_scoring_tokens?player_id=eq.${encodeURIComponent(playerId)}&revoked_at=is.null`;
+  if (operation === 'watch-key-status') {
+    const rows = await db(`${filter}&select=created_at,last_used_at,expires_at&order=created_at.desc&limit=1`);
+    const key = rows?.[0];
+    return reply({ ok: true, connected: !!key && (!key.expires_at || Date.parse(key.expires_at) > Date.now()), createdAt: key?.created_at || null, lastUsedAt: key?.last_used_at || null });
+  }
+  if (!consumeRateLimit(req, `watch-key:${playerId}`, 10, 60_000)) return reply({ error: 'Please wait before managing Watch access again.' }, 429);
+  await db(filter, { method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ revoked_at: new Date().toISOString() }) });
+  if (operation === 'watch-key-revoke') return reply({ ok: true });
+  const token = randomBytes(32).toString('base64url');
+  const tokenHash = createHash('sha256').update(token).digest('hex');
+  await db('watch_scoring_tokens', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ player_id: playerId, token_hash: tokenHash }) });
+  return reply({ ok: true, token }, 200, { 'Cache-Control': 'no-store' });
+}
+
 export default async (req, context = {}) => {
   requestContexts.set(req, context);
   try {
@@ -2797,6 +2891,16 @@ export default async (req, context = {}) => {
     const url = new URL(req.url);
     const action = url.searchParams.get("action") || "state";
     const body = req.method === "GET" ? {} : await req.json().catch(() => ({}));
+
+    if (req.method === 'POST' && action === 'watch-score') {
+      const result = await watchScore(req, body);
+      result.headers.set('Cache-Control', 'no-store');
+      return result;
+    }
+    if (req.method === 'POST' && ['watch-key-status', 'watch-key-generate', 'watch-key-revoke'].includes(action)) {
+      try { return await manageWatchKey(req, action); }
+      catch { return reply({ error:'Watch key operation failed. Please try again.' }, 503, { 'Cache-Control':'no-store' }); }
+    }
 
     if (req.method === "POST" && ["player-login", "admin-login", "admin-profile-login", "passkey-auth-options", "passkey-auth-verify"].includes(action) && !consumeRateLimit(req, action, 20)) {
       return reply({ error: "Too many sign-in attempts. Please wait a minute and try again." }, 429, { "retry-after": "60" });
@@ -2813,8 +2917,10 @@ export default async (req, context = {}) => {
     }
     if (req.method === "GET" && action === "notification-state") return playerNotificationState(req);
     if (req.method === "GET" && action === "media-state") return mediaState(req);
-    if (req.method === "GET" && action === "live-state") return liveState();
-    if (req.method === "GET" && action === "eoi-state") return eoiState();
+    if (req.method === "GET" && (action === "live-state" || action === "eoi-state")) {
+      if (!(await canReadLiveData(req))) return reply({ error: "Sign in to view live session data." }, 401, { "Cache-Control": "no-store" });
+      return action === "live-state" ? liveState() : eoiState();
+    }
     if (req.method === "POST" && action === "player-pin-status") return playerPinStatus(body);
     if (req.method === "POST" && action === "player-create-pin") return createPlayerPin(body);
     if (req.method === "POST" && action === "player-login") return playerLogin(body);

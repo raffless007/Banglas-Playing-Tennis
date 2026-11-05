@@ -97,7 +97,8 @@ test("live point retries are idempotent and schema-backed", () => {
 test("startup failures cannot leave the loading overlay covering the app", () => {
   assert.match(index, /catch\(error\).*loading.*classList\.add\('hidden'\)/s);
   assert.match(index, /setInterval\(pollSyncVersion,300000\)/);
-  assert.match(sw, /bpt-shell-v6/);
+  assert.match(sw, /bpt-shell-v7/);
+  assert.match(sw, /\/js\/score-format\.js/);
   assert.match(sw, /\/js\/scoring-reliability\.js/);
   assert.match(sw, /\/css\/mobile-first\.css/);
 });

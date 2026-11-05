@@ -1,0 +1,24 @@
+-- Run only against an isolated database after its schema and migrations exist.
+begin;
+create extension if not exists pgtap with schema extensions;
+set local search_path = public, extensions;
+select plan(17);
+select has_table('public', 'watch_scoring_tokens', 'Watch token table exists');
+select has_column('public', 'watch_scoring_tokens', 'token_hash', 'Token hash column exists');
+select has_column('public', 'watch_scoring_tokens', 'expires_at', 'Expiry column exists');
+select has_column('public', 'watch_scoring_tokens', 'revoked_at', 'Revocation column exists');
+select ok((select relrowsecurity from pg_class where oid = 'public.watch_scoring_tokens'::regclass), 'Token table has RLS');
+select ok(not has_table_privilege('anon', 'public.watch_scoring_tokens', 'SELECT'), 'Anon cannot read token table');
+select ok(not has_table_privilege('authenticated', 'public.watch_scoring_tokens', 'SELECT'), 'Authenticated cannot read token table');
+select ok(not has_table_privilege('anon', 'public.watch_scoring_tokens', 'INSERT,UPDATE,DELETE'), 'Anon cannot write token table');
+select ok(not has_table_privilege('authenticated', 'public.watch_scoring_tokens', 'INSERT,UPDATE,DELETE'), 'Authenticated cannot write token table');
+select ok(has_table_privilege('service_role', 'public.watch_scoring_tokens', 'SELECT') and has_table_privilege('service_role', 'public.watch_scoring_tokens', 'INSERT') and has_table_privilege('service_role', 'public.watch_scoring_tokens', 'UPDATE') and has_table_privilege('service_role', 'public.watch_scoring_tokens', 'DELETE'), 'Service role has token access');
+select has_column('public', 'match_scores', 'source_live_match_id', 'Durable source match ID exists');
+select col_type_is('public', 'match_scores', 'source_live_match_id', 'uuid', 'Source match ID is UUID');
+select ok(exists(select 1 from pg_indexes where schemaname='public' and indexname='match_scores_source_live_match_id_unique' and indexdef ilike '%WHERE (source_live_match_id IS NOT NULL)%'), 'Source ID has partial unique index');
+select ok(not exists(select 1 from pg_constraint c join pg_attribute a on a.attrelid=c.conrelid and a.attnum=any(c.conkey) where c.conrelid='public.match_scores'::regclass and c.contype='f' and a.attname='source_live_match_id'), 'Source ID has no foreign key');
+select ok(not has_function_privilege('anon', 'public.finalize_live_match_atomic(uuid,integer,uuid,text)', 'EXECUTE'), 'Anon cannot finalize');
+select ok(not has_function_privilege('authenticated', 'public.finalize_live_match_atomic(uuid,integer,uuid,text)', 'EXECUTE'), 'Authenticated cannot finalize');
+select ok(has_function_privilege('service_role', 'public.finalize_live_match_atomic(uuid,integer,uuid,text)', 'EXECUTE'), 'Service role can execute finalization');
+select * from finish();
+rollback;

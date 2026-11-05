@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import * as crypto from 'node:crypto';
 import vm from 'node:vm';
+import '../public/js/score-format.js';
 
 const source=await readFile(new URL('../netlify/functions/api.mjs',import.meta.url),'utf8');
 const client=await readFile(new URL('../public/js/scoring-reliability.js',import.meta.url),'utf8');
@@ -13,7 +14,7 @@ const secret='synthetic-reliability-secret';
 function fixture(){
   let clock=Date.parse('2026-10-21T08:59:59Z');
   class Clock extends Date{constructor(...args){super(...(args.length?args:[clock]));}static now(){return clock;}}
-  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],liveMatches:[],calls:[],pushes:[],gate:null};
+  const state={active:true,revoked:false,pinUpdated:null,adminLastSeen:new Clock().toISOString(),auditHeld:false,audits:[],tasks:[],scores:[],liveMatches:[],watchTokens:[],calls:[],pushes:[],gate:null};
   const events=[{id:'old',event_date:'2026-10-14',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',account_closed:true,court_fee:54,ball_fee:1,location:'Synthetic court',suburb:'Test',max_players:6},{id:'next',event_date:'2026-10-21',start_time:'20:00:00',end_time:'22:00:00',timezone:'Australia/Sydney',location:'Synthetic court',suburb:'Test'}];
   const eois=[participant,other,fourth,owner].map(player_id=>({event_id:'old',player_id,status:'yes',waitlist_position:null}));
   const roster=[owner,participant,other,fourth].map(id=>({id,name:id===owner?'Synthetic owner':'Synthetic participant',active:true}));
@@ -29,6 +30,13 @@ function fixture(){
       if(!state.active)return json([]);
       const id=url.searchParams.get('id')?.slice(3);
       return json((id?roster.filter(row=>row.id===id):roster).map(row=>({...row,pin_updated_at:state.pinUpdated})));
+    }
+    if(table==='watch_scoring_tokens'){
+      const id=url.searchParams.get('player_id')?.slice(3);
+      const rows=state.watchTokens.filter(row=>(!id||row.player_id===id)&&(!url.searchParams.has('revoked_at')||!row.revoked_at));
+      if(method==='POST'){state.watchTokens.push({...body,created_at:new Clock().toISOString(),last_used_at:null,expires_at:null,revoked_at:null});return new Response('');}
+      if(method==='PATCH'){rows.forEach(row=>Object.assign(row,body));return new Response('');}
+      return json(rows);
     }
     if(table==='player_sessions')return method==='GET'?json(state.revoked?[]:[{session_id:'player-session',last_seen_at:new Clock().toISOString()}]):new Response('');
     if(table==='admin_sessions')return method==='GET'?json([{session_id:'admin-session',last_seen_at:state.adminLastSeen}]):new Response('');
@@ -46,7 +54,20 @@ function fixture(){
     }
     if(table==='eois'){
       if(method==='POST'){const at=eois.findIndex(row=>row.event_id===body.event_id&&row.player_id===body.player_id);if(at>=0)eois[at]=body;else eois.push(body);return new Response('');}
-      return json(eois.filter(row=>(!url.searchParams.get('event_id')||row.event_id===url.searchParams.get('event_id').slice(3))&&(!url.searchParams.has('status')||row.status==='yes')));
+      return json(eois.filter(row=>(!url.searchParams.get('event_id')||row.event_id===url.searchParams.get('event_id').slice(3))&&(!url.searchParams.get('player_id')||row.player_id===url.searchParams.get('player_id').slice(3))&&(!url.searchParams.has('status')||row.status==='yes')&&(!url.searchParams.has('waitlist_position')||row.waitlist_position==null)));
+    }
+    if(table==='finalize_live_match_atomic'){
+      const {p_match_id:id,p_expected_version:version,p_submitted_by:player,p_caller_mode:mode}=body;
+      const saved=state.scores.find(row=>row.source_live_match_id===id);
+      const live=state.liveMatches.find(row=>row.id===id),source=live||saved;
+      if(!source)return json({status:'not_found'});
+      const attending=eois.some(row=>row.event_id===source.event_id&&row.player_id===player&&row.status==='yes'&&row.waitlist_position==null);
+      if(mode!=='admin'&&!attending)return json({status:'forbidden'});
+      if(saved)return json({status:'already_saved',score:saved});
+      if(Number(live.version||0)!==version)return json({status:'conflict'});
+      if(!live.completed||live.needs_tiebreak_choice)return json({status:'unfinished'});
+      const score={id:crypto.randomUUID(),event_id:live.event_id,match_type:live.match_type||'doubles',games_to_win:live.games_to_win||4,tiebreak_to_win:live.tiebreak_to_win||5,team_a_player_ids:live.team_a_player_ids,team_b_player_ids:live.team_b_player_ids,games_a:live.games_a,games_b:live.games_b,tiebreak_a:live.is_tiebreak?live.tiebreak_a:null,tiebreak_b:live.is_tiebreak?live.tiebreak_b:null,points_a:live.points_a,points_b:live.points_b,submitted_by:player,live_match_id:null,source_live_match_id:id,started_at:live.started_at};
+      state.scores.push(score);state.liveMatches=state.liveMatches.filter(row=>row.id!==id);return json({status:'saved',score});
     }
     if(table==='match_scores'){
       if(method==='POST'){
@@ -62,7 +83,7 @@ function fixture(){
   };
   const code=source.replace(/^import[\s\S]*?;\n/gm,'').replace(/^export \{[^}]*\};/gm,'').replace('export default async (req, context = {}) =>','return async (req, context = {}) =>');
   const createClient=()=>({storage:{from:()=>({list:async(_folder,{search})=>({data:[{name:search,metadata:{size:1024}}],error:null})})}});
-  const handler=new Function('deps',`const {createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process,Date,activePlayerIds,notifyPlayers,RAFEED_PLAYER_ID,createClient}=deps;\n${code}`)({...crypto,fetch,Date:Clock,activePlayerIds:async()=>[],notifyPlayers:async payload=>{state.pushes.push(payload);return {sent:0}},RAFEED_PLAYER_ID:owner,createClient,process:{env:{SUPABASE_URL:'https://synthetic.invalid',SUPABASE_SERVICE_ROLE_KEY:'synthetic',ADMIN_SESSION_SECRET:secret}}});
+  const handler=new Function('deps',`const {createHash,createHmac,pbkdf2Sync,randomBytes,randomUUID,timingSafeEqual,fetch,process,Date,activePlayerIds,notifyPlayers,RAFEED_PLAYER_ID,createClient}=deps;\n${code}`)({...crypto,fetch,Date:Clock,activePlayerIds:async()=>[],notifyPlayers:async payload=>{state.pushes.push(payload);return {sent:0}},RAFEED_PLAYER_ID:owner,createClient,process:{env:{SUPABASE_URL:'https://synthetic.invalid',SUPABASE_SERVICE_ROLE_KEY:'synthetic',ADMIN_SESSION_SECRET:secret}}});
   function token(type,id=participant){const raw=Buffer.from(JSON.stringify({type,sub:type==='player'?id:undefined,sid:type==='player'?'player-session':'admin-session',iat:clock-1000,exp:clock+86400000})).toString('base64url');return `${raw}.${crypto.createHmac('sha256',secret).update(raw).digest('base64url')}`;}
   async function request(action,body={},auth={player:participant},background=true){
     const headers={'content-type':'application/json'};
@@ -70,10 +91,43 @@ function fixture(){
     if(auth.admin)headers.authorization=`Bearer ${typeof auth.admin==='string'?auth.admin:token('admin')}`;
     return handler(new Request(`https://app.invalid/?action=${action}`,{method:'POST',headers,body:JSON.stringify(body)}),background?{waitUntil:task=>state.tasks.push(task)}:{});
   }
-  return {state,events,eois,request,token,now:value=>{clock=Date.parse(value);},flush:()=>Promise.all(state.tasks)};
+  async function get(action,auth={player:participant}){
+    const headers={};if(auth.player)headers['x-player-session']=token('player',auth.player);if(auth.admin)headers.authorization=`Bearer ${token('admin')}`;
+    return handler(new Request(`https://app.invalid/?action=${action}`,{headers}));
+  }
+  return {state,events,eois,request,get,token,now:value=>{clock=Date.parse(value);},flush:()=>Promise.all(state.tasks)};
 }
 const match={matchType:'doubles',gamesToWin:4,teamA:[participant,other],teamB:[owner,fourth],gamesA:'3',gamesB:'3',tiebreakA:'5',tiebreakB:'2'};
 const scoreBody=(overrides={})=>({eventId:'old',submittedBy:participant,matches:[match],submissionId:'44444444-4444-4444-a444-444444444444',...overrides});
+
+test('shared Watch score labels match the original phone display rules',()=>{
+  const original=(a,b,side)=>{if(a>=3&&b>=3){if(a===b)return'Deuce';if(side==='a'&&a>b)return'Ad';if(side==='b'&&b>a)return'Ad';return'40'}return ['0','15','30','40'][side==='a'?a:b]||'40'};
+  for(let a=0;a<9;a++)for(let b=0;b<9;b++)for(const side of ['a','b'])assert.equal(globalThis.BPTScoreFormat.point(a,b,side),original(a,b,side));
+  assert.deepEqual(globalThis.BPTScoreFormat.parts({is_tiebreak:true,tiebreak_a:7,tiebreak_b:5}),['7','5']);
+});
+
+test('live and EOI polling requires a session without extending idle time',async()=>{
+  const app=fixture();assert.equal((await app.get('live-state',{})).status,401);assert.equal((await app.get('eoi-state',{})).status,401);
+  assert.equal((await app.get('live-state')).status,200);assert.equal((await app.get('eoi-state',{admin:true})).status,200);
+  assert.equal(app.state.calls.filter(row=>['player_sessions','admin_sessions'].includes(row.table)&&row.method==='PATCH').length,0);
+  app.state.revoked=true;assert.equal((await app.get('live-state')).status,401);
+});
+
+test('Watch keys require a player session and store only the signed-in player’s token hash',async()=>{
+  const app=fixture();
+  assert.equal((await app.request('watch-key-generate',{playerId:other},{})).status,401);
+  const response=await app.request('watch-key-generate',{playerId:other});
+  assert.equal(response.status,200);
+  const {token}=await response.json();
+  assert.equal(Buffer.from(token,'base64url').length,32);
+  assert.equal(app.state.watchTokens[0].player_id,participant);
+  assert.equal(app.state.watchTokens[0].token_hash,crypto.createHash('sha256').update(token).digest('hex'));
+  assert.ok(!JSON.stringify(app.state.watchTokens).includes(token));
+  const status=await (await app.request('watch-key-status')).json();
+  assert.equal(status.connected,true);assert.ok(!JSON.stringify(status).includes(token));
+  assert.equal((await app.request('watch-key-revoke')).status,200);
+  assert.equal((await (await app.request('watch-key-status')).json()).connected,false);
+});
 
 test('participants can save after 24 hours up to, but not at, the next event start',async()=>{
   const app=fixture();
@@ -132,12 +186,12 @@ test('live match setup uses a provisional default until the doubles 3–3 choice
   assert.equal(response.status,200);assert.equal(app.state.liveMatches[0].tiebreak_to_win,5);assert.equal(app.state.liveMatches[0].needs_tiebreak_choice,false);
 });
 test('finishing a live match returns its saved score immediately and retries safely',async()=>{
-  const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,started_at:'2026-10-21T07:00:00.000Z'};
+  const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,version:0,started_at:'2026-10-21T07:00:00.000Z'};
   app.now('2026-10-21T09:01:00Z');app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));
   app.state.liveMatches.push(live);
-  const first=await app.request('live-finish',{matchId:live.id,playerId:participant});
-  const saved=await first.json();assert.equal(first.status,200);assert.equal(saved.score.live_match_id,live.id);assert.equal(saved.score.games_a,4);assert.equal(app.state.liveMatches.length,0);assert.equal(app.state.scores.length,1);
-  const retry=await app.request('live-finish',{matchId:live.id,playerId:participant});
+  const first=await app.request('live-finish',{matchId:live.id,playerId:participant,expectedVersion:0});
+  const saved=await first.json();assert.equal(first.status,200);assert.equal(saved.score.source_live_match_id,live.id);assert.equal(saved.score.games_a,4);assert.equal(app.state.liveMatches.length,0);assert.equal(app.state.scores.length,1);
+  const retry=await app.request('live-finish',{matchId:live.id,playerId:participant,expectedVersion:0});
   assert.equal(retry.status,200);assert.equal((await retry.json()).score.id,saved.score.id);assert.equal(app.state.scores.length,1);
   await app.flush();assert.equal(app.state.pushes.length,1);assert.deepEqual(app.state.pushes[0].playerIds,[owner]);assert.equal(app.state.pushes[0].notificationType,'matches');
   assert.match(appSource,/if\(result\.score\)\{data\.scores=\[result\.score/);
@@ -196,6 +250,8 @@ test('client write timeout is ambiguous, not a claimed failure, and confirmed ad
   await assert.rejects(app.context.transportRequest('eoi','POST',{}),error=>error.uncertain===true&&/may have reached/.test(error.message));
   let options;app.context.fetch=async(url,input)=>{options=input;return new Response('{"ok":true}');};app.context.adminToken='synthetic-admin';
   assert.equal((await app.context.transportRequest('score','POST',{},true)).ok,true);assert.equal(options.headers.authorization,'Bearer synthetic-admin');
+  app.context.fetch=async()=>new Response('{"error":"Score refreshed","conflict":true}',{status:409});
+  await assert.rejects(app.context.transportRequest('live-finish','POST',{},true),error=>error.conflict===true&&error.uncertain===false);
 });
 test('score drafts survive a failed save and reuse the same submission key on retry',async()=>{
   const app=clientFixture(),attempts=[];let fail=true;
