@@ -49,6 +49,7 @@
     return data.events.filter(row=>row.id!==event.id&&!row.deleted_at&&row.cancellation_status!=='cancelled')
       .map(sessionStart).filter(date=>date>opens).sort((a,b)=>a-b)[0] || new Date(8640000000000000);
   };
+  liveScoringOpenFor = event => !event.deleted_at && event.cancellation_status!=='cancelled' && new Date()>=sessionStart(event);
   scoringOpenFor = event => !event.deleted_at && event.cancellation_status!=='cancelled' && new Date()>=sessionStart(event) && new Date()<scoringClosesFor(event);
   scoringWindowText = function(event) {
     if (adminToken) return 'Admin can add or correct scores for any week, including closed weeks.';
@@ -89,12 +90,8 @@
       note.textContent=`${event?scoringWindowText(event):''} For race-to-4 tie-breaks, enter 3–3 plus the tie-break points; a valid winner is saved as 4–3. Unsaved matches stay on this device until confirmed.`;
       help.before(note);
     }
-    // The longer window is for entering completed results. Existing live
-    // scoring still uses its separate match-day window and controls.
-    if (event && !adminToken && new Date()>new Date(eventMoment(event,endTime(event)).getTime()+24*3600000) && $('startLive')) {
-      const manual = entry.querySelector('.match-draft')?.parentElement;
-      if (manual) for (const child of [...entry.querySelector('.score-entry').children]) { if(child===manual) break; child.classList.add('hidden'); }
-    }
+    // Live controls stay available after the session begins; completed-result
+    // entry remains limited by scoringOpenFor and the server's next-session rule.
     entry?.querySelectorAll('p.sub').forEach(node=>{
       if(node.textContent.includes('24 hours after the session ends')) node.textContent='Participants can add completed matches until the next scheduled session starts. Admin can add or correct them at any time.';
     });

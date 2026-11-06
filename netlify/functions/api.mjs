@@ -27,7 +27,6 @@ const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 // its own provider plan limits; this is the quota enforced by the API.
 const MEDIA_TOTAL_BYTES = 5 * 1024 * 1024 * 1024;
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
-const SCORING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PLAYERS_PER_COURT = 6;
 const PLAYER_SERVER_IDLE_MS = 24 * 60 * 60 * 1000;
 const ADMIN_SERVER_IDLE_MS = 60 * 60 * 1000;
@@ -214,17 +213,9 @@ async function eventClosureNotification(event) {
   };
 }
 
-function scoringWindow(event) {
+function liveScoringWindowError(event) {
   const opens = localDateTimeToUtc(event.event_date, eventStartTime(event));
-  const closes = new Date(localDateTimeToUtc(event.event_date, eventEndTime(event)).getTime() + SCORING_WINDOW_MS);
-  return { opens, closes };
-}
-
-function scoringWindowError(event) {
-  const now = new Date();
-  const { opens, closes } = scoringWindow(event);
-  if (now < opens) return "Scoring opens when this week’s session starts.";
-  if (now > closes) return "Scoring has closed for this week. It stays open for 24 hours after the session ends.";
+  if (new Date() < opens) return "Live scoring opens when this week’s session starts.";
   return "";
 }
 
@@ -1391,7 +1382,7 @@ function liveAdvance(match, winner) {
 async function startLiveMatch(body, adminOverride = false) {
   const event = await getEvent(body.eventId);
   if (!event || !body.playerId) return reply({ error: "Event or player not found." }, 404);
-  const windowError = scoringWindowError(event);
+  const windowError = liveScoringWindowError(event);
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(body.eventId, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
@@ -1438,7 +1429,7 @@ async function chooseLiveTiebreak(body, adminOverride = false) {
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const [event, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  const windowError = event ? liveScoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (body.expectedVersion !== undefined && body.expectedVersion !== Number(match.version || 0)) return reply({ error: "This match changed on another device. Refresh and try again.", conflict: true }, 409);
@@ -1465,7 +1456,7 @@ async function updateLiveServer(body, adminOverride = false) {
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getEvent(match.event_id);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  const windowError = event ? liveScoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
@@ -1505,7 +1496,7 @@ async function addLivePoint(body, adminOverride = false) {
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const [event, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  const windowError = event ? liveScoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   if (match.needs_tiebreak_choice) return reply({ error: "Choose a 5- or 7-point tie-break before play continues." }, 409);
@@ -1575,7 +1566,7 @@ async function undoLivePoint(body, adminOverride = false) {
   const match = rows?.[0];
   if (!match || !body.playerId) return reply({ error: "Live match not found." }, 404);
   const event = await getScoringEvent(match.event_id);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  const windowError = event ? liveScoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId, true);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
@@ -1604,7 +1595,7 @@ async function abandonLiveMatch(body, adminOverride = false) {
   if (!body.playerId) return reply({ error: "Live match not found." }, 404);
   if (!match) return reply({ ok: true, matchId: body.matchId, alreadyAbandoned: true });
   const event = await getEvent(match.event_id);
-  const windowError = event ? scoringWindowError(event) : "Event not found.";
+  const windowError = event ? liveScoringWindowError(event) : "Event not found.";
   if (windowError && !adminOverride) return reply({ error: windowError }, 403);
   const attending = await attendingSet(match.event_id, body.playerId);
   if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
@@ -1625,7 +1616,7 @@ async function finishLiveMatch(body, adminOverride = false, req = null, trustedW
   if (match) {
     const [foundEvent, attending] = await Promise.all([getScoringEvent(match.event_id), attendingSet(match.event_id, body.playerId, true)]);
     event = foundEvent;
-    const windowError = event ? scoringWindowError(event) : "Event not found.";
+    const windowError = event ? liveScoringWindowError(event) : "Event not found.";
     if (windowError && !adminOverride) return reply({ error: windowError }, 403);
     if (!attending && !adminOverride) return reply({ error: "Only players marked In can control live scoring." }, 403);
   }

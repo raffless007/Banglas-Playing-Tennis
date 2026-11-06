@@ -185,6 +185,21 @@ test('live match setup uses a provisional default until the doubles 3–3 choice
   const response=await app.request('live-start',{eventId:'next',playerId:participant,matchType:'doubles',teamA:[participant,other],teamB:[owner,fourth],teamAServerId:participant,teamBServerId:owner});
   assert.equal(response.status,200);assert.equal(app.state.liveMatches[0].tiebreak_to_win,5);assert.equal(app.state.liveMatches[0].needs_tiebreak_choice,false);
 });
+test('live scoring stays available after the session and later sessions have passed',async()=>{
+  const app=fixture();app.now('2026-10-28T10:00:00Z');
+  app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'old',player_id,status:'yes',waitlist_position:null})));
+  const started=await app.request('live-start',{eventId:'old',playerId:participant,matchType:'doubles',teamA:[participant,other],teamB:[owner,fourth],teamAServerId:participant,teamBServerId:owner});
+  assert.equal(started.status,200,JSON.stringify(await started.clone().json()));
+  const id=app.state.liveMatches[0].id;
+  assert.equal((await app.request('live-point',{matchId:id,playerId:participant,winner:'a'})).status,200);
+  assert.equal((await app.request('live-undo',{matchId:id,playerId:participant})).status,200);
+  assert.equal((await app.request('live-abandon',{matchId:id,playerId:participant})).status,200);
+  const completed={id:'old-finish',event_id:'old',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,version:0,started_at:'2026-10-14T09:00:00.000Z'};
+  app.state.liveMatches.push(completed);
+  const finish=await app.request('live-finish',{matchId:completed.id,playerId:participant,expectedVersion:0});
+  assert.equal(finish.status,200,JSON.stringify(await finish.clone().json()));
+  assert.equal(app.state.scores[0].source_live_match_id,completed.id);
+});
 test('finishing a live match returns its saved score immediately and retries safely',async()=>{
   const app=fixture(),live={id:'live-finish-1',event_id:'next',match_type:'doubles',games_to_win:4,team_a_player_ids:[participant,other],team_b_player_ids:[owner,fourth],games_a:4,games_b:2,points_a:18,points_b:12,is_tiebreak:false,tiebreak_a:0,tiebreak_b:0,completed:true,version:0,started_at:'2026-10-21T07:00:00.000Z'};
   app.now('2026-10-21T09:01:00Z');app.eois.push(...[participant,other,owner,fourth].map(player_id=>({event_id:'next',player_id,status:'yes',waitlist_position:null})));

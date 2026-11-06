@@ -103,9 +103,12 @@ test("startup failures cannot leave the loading overlay covering the app", () =>
   assert.match(sw, /\/css\/mobile-first\.css/);
 });
 
-test("high-risk production constants are not accidentally reduced", () => {
+test("media capacity remains unchanged and live scoring has no post-session expiry", () => {
   assert.match(api, /MEDIA_TOTAL_BYTES\s*=\s*5\s*\*\s*1024\s*\*\s*1024\s*\*\s*1024/);
-  assert.match(api, /SCORING_WINDOW_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
+  assert.match(api, /function liveScoringWindowError\(event\)\s*\{[^}]*if\s*\(new Date\(\) < opens\)[^}]*return "Live scoring opens when this week’s session starts\.";\s*return "";/);
+  assert.doesNotMatch(api, /SCORING_WINDOW_MS/);
+  assert.match(runtime, /function liveScoringOpenFor\(e\)\{[^}]*new Date\(\)>=eventMoment\(e,startTime\(e\)\)/);
+  assert.match(reliabilityClient, /liveScoringOpenFor = event =>[^\n]*new Date\(\)>=sessionStart\(event\)/);
 });
 
 test("authenticated players can see payment timestamps for everyone", () => {
